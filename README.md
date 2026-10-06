@@ -52,7 +52,7 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | **Ctrl+E** | Jump to the line that raised the error |
 | **Ctrl+P** | Open a file in this folder |
 | **Ctrl+N** | New scratch file |
-| **Ctrl+K** | All commands |
+| **Ctrl+K** | All commands, including Install a package |
 | **Alt+F** or **F8** | Format with ruff |
 | **Ctrl+/** | Comment or uncomment lines |
 | **Ctrl+D** | Duplicate line (in the input box: end of input) |
@@ -70,6 +70,18 @@ Files save automatically one second after you stop typing.
 - **Readable errors.** The exception first, then your line with Python's own markers. Library frames are hidden. Click the location or press Ctrl+E to jump there.
 - **Suggestions as you type** (Jedi, in a separate process so typing never waits), with signature and docs beside the list.
 - **ruff** checks while you pause. A dot in the margin marks the line; the message shows in the status bar when your cursor is on it.
+
+## Packages
+
+**Ctrl+K → Install a package**, type a name like `requests`, press Enter. pytobs creates a `.venv` in your
+project folder the first time and installs into it; the status bar switches to it and suggestions include
+the new package. **Ctrl+K → How to install packages** shows the steps again, including the PowerShell way:
+
+```powershell
+cd your-project
+uv venv
+uv pip install requests
+```
 
 ## Settings
 

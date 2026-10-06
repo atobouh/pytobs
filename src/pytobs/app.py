@@ -16,11 +16,11 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.command import CommandPalette, DiscoveryHit, Hit, Hits, Provider, SearchIcon
 from textual.containers import Horizontal, Vertical
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import Input, Static, TextArea
 
-from . import lint, tracebacks
+from . import lint, packages, tracebacks
 from .completion.client import CompletionClient
 from .editor import CodeEditor
 from .env import Interpreter, find_interpreter, interpreter_version
@@ -175,6 +175,8 @@ class Pytobs(App[None]):
         self._debouncers: dict[str, Timer] = {}
         self._layout_forced: str | None = None
         self._stopped = False
+        self._activity: str | None = None  # label shown while a non-script command runs
+        self._note: Text | None = None  # result line for the run header (e.g. after an install)
         self.register_theme(APP_THEME)
         self.theme = "sumi"
 
@@ -225,7 +227,7 @@ class Pytobs(App[None]):
             ("Ctrl+E", "jump to an error"),
             ("Ctrl+P", "open a file"),
             ("Ctrl+N", "new scratch file"),
-            ("Ctrl+K", "all commands"),
+            ("Ctrl+K", "all commands, install packages"),
         ):
             line = Text()
             line.append(f"{key:<8}", style=C.text)
@@ -352,9 +354,11 @@ class Pytobs(App[None]):
         if run and not run.finished:
             frame = G.spinner[int(time.monotonic() * 8) % len(G.spinner)]
             t.append(f"{frame} ", style=C.accent)
-            t.append("running", style=C.text)
+            t.append(self._activity or "running", style=C.text)
             t.append(f"   {run.elapsed:5.1f}s", style=C.muted)
             t.append("     ^C stop", style=C.faint)
+        elif self._note is not None:
+            t.append_text(self._note)
         elif self.last_run:
             code, seconds = self.last_run
             t.append(f"{G.run} ", style=C.accent)
@@ -727,6 +731,8 @@ class Pytobs(App[None]):
         stdin.add_class("show")
         stdin.focus()  # typing goes to the program while it runs; Esc returns to the editor
         self._stopped = False
+        self._note = None
+        self._activity = None
         self._debouncers["tick"] = self.set_interval(1 / 8, self._render_runhead)
         await self.current.start()
         self._render_runhead()
@@ -871,6 +877,16 @@ class Pytobs(App[None]):
         yield SystemCommand(
             "New scratch file", "Start a fresh scratch file  (Ctrl+N)", self.action_new_scratch
         )
+        yield SystemCommand(
+            "Install a package",
+            "pip install into this folder's .venv, e.g. requests",
+            self.action_install_package,
+        )
+        yield SystemCommand(
+            "How to install packages",
+            "Show the steps, also for doing it in PowerShell",
+            self.action_package_help,
+        )
         yield SystemCommand("Format file", "Format with ruff  (Alt+F)", self.action_format)
         yield SystemCommand("Jump to error", "Cursor to the failing line  (Ctrl+E)", self.action_jump_error)
         yield SystemCommand("Clear output", "Empty the output pane  (Ctrl+L)", self.action_clear_output)
@@ -879,6 +895,132 @@ class Pytobs(App[None]):
         )
         yield SystemCommand("Save", "Save now (autosave is on)  (Ctrl+S)", self.action_save)
         yield SystemCommand("Quit", "Save and quit  (Ctrl+Q)", self.action_quit)
+
+    # ── packages ─────────────────────────────────────────────────────────────
+
+    def action_install_package(self) -> None:
+        self.push_screen(PackagePrompt(), self._on_package_names)
+
+    def _on_package_names(self, text: str | None) -> None:
+        if not text:
+            return
+        good, bad = packages.parse_packages(text)
+        if bad:
+            self.notify(f"Not a package name: {' '.join(bad)}", severity="warning")
+        if good:
+            self.run_worker(self._install(good), exclusive=True, group="run")
+
+    async def _install(self, names: list[str]) -> None:
+        if self.current and not self.current.finished:
+            await self.current.stop(grace=0.5)
+        if not self.file_path:
+            return
+        self.save()
+        folder = self.file_path.parent
+        interp = await asyncio.to_thread(find_interpreter, self.file_path, self.python_override)
+        plan = packages.plan(folder, interp, names)
+        out = self.output
+        out.clear()
+        label = " ".join(names)
+        head = Text()
+        head.append("Installing ", style=C.muted)
+        head.append(label, style=C.text)
+        head.append(f"  into {plan.where}", style=C.muted)
+        out.add_line(head)
+        if plan.creates_venv:
+            out.add_line(
+                Text(
+                    f"Creating {folder.name}{os.sep}.venv first, so packages stay with this project.",
+                    style=C.faint,
+                )
+            )
+        out.add_line(Text(""))
+        self._note = None
+        self._stopped = False
+        self._debouncers["tick"] = self.set_interval(1 / 8, self._render_runhead)
+        code = 0
+        for step in plan.steps:
+            self._activity = f"installing {label}" if "install" in step else "creating .venv"
+            code = await self._run_command(step, folder)
+            if code != 0 or self._stopped:
+                break
+        timer = self._debouncers.pop("tick", None)
+        if timer:
+            timer.stop()
+        self._activity = None
+        note = Text()
+        out.ensure_newline()
+        out.add_line(Text(""))
+        if self._stopped:
+            note.append(f"{G.cross} install stopped", style=C.muted)
+        elif code == 0:
+            note.append(f"{G.dot} ", style=C.ok)
+            note.append(f"installed {label}", style=C.text)
+            done = Text()
+            done.append(f"{G.dot} ", style=C.ok)
+            done.append(f"{label} is ready to import.", style=C.text)
+            out.add_line(done)
+            # switch to the (possibly new) .venv: status bar and suggestions follow it
+            self.interp = None
+            self.py_version = None
+            self.detect_interpreter()
+        else:
+            note.append(f"{G.cross} install failed", style=C.error)
+            out.add_line(
+                Text(
+                    f"{G.cross} Install failed. Check the package name and your internet connection.",
+                    style=C.error,
+                )
+            )
+        self._note = note
+        self._render_runhead()
+
+    async def _run_command(self, argv: list[str], cwd: Path) -> int:
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[int] = loop.create_future()
+
+        def on_output(text: str, stream: str) -> None:
+            self.output.write(text, Style(color=C.muted))
+
+        def on_exit(code: int, seconds: float) -> None:
+            if not done.done():
+                done.set_result(code)
+
+        assert self.file_path
+        self.current = Run(argv[0], self.file_path, on_output, on_exit, argv=argv, cwd=cwd)
+        await self.current.start()
+        return await done
+
+    def action_package_help(self) -> None:
+        out = self.output
+        out.clear()
+        folder = self.file_path.parent if self.file_path else Path.cwd()
+
+        def line(*parts: tuple[str, str]) -> None:
+            t = Text()
+            for text, style in parts:
+                t.append(text, style=style)
+            out.add_line(t)
+
+        line(("Installing packages", C.text))
+        line(("", ""))
+        line(("From pytobs", C.accent))
+        line(("  Ctrl+K", C.text), ("  then  ", C.muted), ("Install a package", C.text))
+        line(("  type a name like ", C.muted), ("requests", C.text), (" and press Enter", C.muted))
+        line(("", ""))
+        line(("From PowerShell, in your project folder", C.accent))
+        line(("  cd ", C.muted), (str(folder), C.text))
+        line(("  uv venv", C.text), ("              once per project", C.faint))
+        line(("  uv pip install requests", C.text))
+        line(("", ""))
+        line(
+            ("Either way the packages go into ", C.muted),
+            (".venv", C.text),
+            (" next to your files.", C.muted),
+        )
+        line(("pytobs uses that .venv automatically: see the status bar.", C.muted))
+        self._note = None
+        self._render_runhead()
 
     async def action_quit(self) -> None:
         self.save()
@@ -895,6 +1037,37 @@ class Pytobs(App[None]):
         if timer:
             timer.stop()
         self._debouncers[name] = self.set_timer(delay, callback)
+
+
+class PackagePrompt(ModalScreen[str | None]):
+    """Ask which packages to install."""
+
+    DEFAULT_CSS = f"""
+    PackagePrompt {{ background: {C.base} 55%; align-horizontal: center; }}
+    PackagePrompt > Vertical {{
+        width: 64; max-width: 92%; height: auto; margin-top: 3; background: {C.surface}; padding: 1 2;
+    }}
+    PackagePrompt #title {{ color: {C.text}; height: 1; }}
+    PackagePrompt #hint {{ color: {C.muted}; height: 1; margin-bottom: 1; }}
+    PackagePrompt Input, PackagePrompt Input:focus {{
+        border: none; background: {C.overlay}; color: {C.text}; padding: 0 1; height: 1;
+    }}
+    PackagePrompt #keys {{ color: {C.faint}; height: 1; margin-top: 1; }}
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Install a package", id="title")
+            yield Static("Goes into this folder's .venv. Separate names with spaces.", id="hint")
+            yield Input(placeholder="requests", id="packages")
+            yield Static("Enter install   Esc cancel", id="keys")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class Palette(CommandPalette):

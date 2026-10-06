@@ -26,9 +26,13 @@ class Run:
         script: Path,
         on_output: OutputCallback,
         on_exit: ExitCallback,
+        argv: list[str] | None = None,
+        cwd: Path | None = None,
     ) -> None:
         self.python = python
         self.script = script
+        self.argv = argv or [python, "-u", str(script)]  # any command, e.g. a package install
+        self.cwd = cwd or script.parent
         self.on_output = on_output
         self.on_exit = on_exit
         self.process: asyncio.subprocess.Process | None = None
@@ -52,19 +56,17 @@ class Run:
         self.started_at = time.perf_counter()
         try:
             self.process = await asyncio.create_subprocess_exec(
-                self.python,
-                "-u",
-                str(self.script),
+                *self.argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.script.parent),
+                cwd=str(self.cwd),
                 env=env,
                 **kwargs,  # type: ignore[arg-type]
             )
         except OSError as exc:
             self.finished = True
-            self.on_output(f"Could not start {self.python}: {exc}\n", "stderr")
+            self.on_output(f"Could not start {self.argv[0]}: {exc}\n", "stderr")
             self.on_exit(-1, self.elapsed)
             return
         assert self.process.stdout and self.process.stderr
