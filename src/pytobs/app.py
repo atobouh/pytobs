@@ -258,7 +258,7 @@ class Pytobs(App[None]):
             self.remember_cursor()
         path = path.expanduser()
         try:
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            text = path.read_text(encoding="utf-8-sig") if path.exists() else ""  # tolerate Notepad BOMs
         except (OSError, UnicodeDecodeError) as exc:
             self.notify(f"Can't open {path.name}: {exc}", severity="error")
             return
