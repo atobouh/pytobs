@@ -3,6 +3,8 @@
 Status: **for review. No product code until this is confirmed.**
 Working name: `pytobs` (the repo name). Brief: `research-brief.md` (goal, non-goals, deliverables).
 
+**Update (Oct 6):** target OS is **Windows** (Windows Terminal). One direction chosen for speed and reliability: **A "Sumi"** with Textual, Jedi in a worker process, and ruff. The visual version of this proposal, with screens rendered by Textual in the chosen theme, is in `docs/visual/index.html`; the mockup script is `research/mockup/mock.py`. Windows notes: interpreter lookup is `.venv\Scripts\python.exe`, then the `py` launcher; stop uses `CTRL_BREAK_EVENT` to the process group, then ends the process tree; Windows Terminal supports truecolor and OSC 52, and the legacy console gets the 256-colour theme.
+
 ---
 
 ## 0. TL;DR
