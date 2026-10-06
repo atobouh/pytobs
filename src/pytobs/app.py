@@ -1,0 +1,942 @@
+"""pytobs: write, run, fix."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from collections.abc import Iterable
+from functools import partial
+from pathlib import Path
+
+from rich.style import Style
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult, SystemCommand
+from textual.binding import Binding
+from textual.command import CommandPalette, DiscoveryHit, Hit, Hits, Provider, SearchIcon
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.timer import Timer
+from textual.widgets import Input, Static, TextArea
+
+from . import lint, tracebacks
+from .completion.client import CompletionClient
+from .editor import CodeEditor
+from .env import Interpreter, find_interpreter, interpreter_version
+from .output import OutputLog
+from .paths import Config, Session, atomic_write, new_scratch_path, scratch_dir
+from .runner import Run
+from .theme import APP_THEME, C, G
+
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    "node_modules",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "site-packages",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+}
+
+
+def short_path(path: Path) -> str:
+    try:
+        return "~" + os.sep + str(path.resolve().relative_to(Path.home().resolve()))
+    except ValueError:
+        return str(path)
+
+
+class FileProvider(Provider):
+    """Fuzzy-open Python files under the working folder and the scratch folder."""
+
+    def _files(self) -> list[Path]:
+        roots = [Path.cwd()]
+        app = self.app
+        if isinstance(app, Pytobs) and app.file_path:
+            roots.insert(0, app.file_path.parent)
+        roots.append(scratch_dir())
+        seen: dict[str, Path] = {}
+        for root in roots:
+            if not root.exists():
+                continue
+            count = 0
+            for folder, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+                for name in files:
+                    if name.endswith((".py", ".pyw", ".txt", ".toml", ".json", ".md", ".csv")):
+                        p = Path(folder) / name
+                        seen.setdefault(str(p.resolve()), p)
+                        count += 1
+                if count > 3000 or folder.count(os.sep) - str(root).count(os.sep) > 6:
+                    dirs[:] = []
+        return sorted(seen.values(), key=lambda p: (p.suffix != ".py", str(p).lower()))
+
+    async def startup(self) -> None:
+        self._cache = await asyncio.to_thread(self._files)
+
+    def _label(self, p: Path) -> str:
+        try:
+            return str(p.resolve().relative_to(Path.cwd().resolve()))
+        except ValueError:
+            return short_path(p)
+
+    async def discover(self) -> Hits:
+        for p in self._cache[:40]:
+            yield DiscoveryHit(self._label(p), partial(self._open, p), help=None)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for p in self._cache:
+            label = self._label(p)
+            score = matcher.match(label)
+            if score > 0:
+                yield Hit(score, matcher.highlight(label), partial(self._open, p))
+
+    def _open(self, p: Path) -> None:
+        app = self.app
+        if isinstance(app, Pytobs):
+            app.open_file(p)
+
+
+CSS = f"""
+Screen {{ background: {C.base}; layers: base popup; }}
+#main {{ height: 1fr; }}
+#editor-col {{ width: 3fr; background: {C.base}; }}
+#tabline {{ height: 1; padding: 0 2; margin-bottom: 1; color: {C.muted}; background: {C.base}; }}
+CodeEditor {{ border: none; padding: 0 1 0 0; background: {C.base}; height: 1fr; scrollbar-size-vertical: 1; scrollbar-size-horizontal: 0; }}
+CodeEditor:focus {{ border: none; }}
+#output-col {{ width: 2fr; min-width: 30; background: {C.mantle}; padding: 0 0 0 2; }}
+#runhead {{ height: 1; margin-bottom: 1; padding-right: 2; }}
+OutputLog {{ height: 1fr; }}
+#stdin {{ height: 1; border: none; padding: 0; margin: 1 2 0 0; background: {C.surface}; color: {C.text}; display: none; }}
+#stdin:focus {{ border: none; }}
+#stdin.show {{ display: block; }}
+#status {{ dock: bottom; height: 1; background: {C.mantle}; color: {C.muted}; padding: 0 2; }}
+Screen.stacked #main {{ layout: vertical; }}
+Screen.stacked #editor-col {{ width: 1fr; height: 3fr; }}
+Screen.stacked #output-col {{ width: 1fr; height: 2fr; padding: 1 0 0 2; }}
+#popup {{ layer: popup; position: absolute; width: auto; height: auto; display: none; }}
+#popup.show {{ display: block; }}
+#menu {{ width: auto; height: auto; background: {C.surface}; }}
+#doc {{ width: auto; max-width: 64; height: auto; overflow: hidden hidden; background: {C.surface}; padding: 1 2; margin-left: 1; display: none; }}
+#doc.show {{ display: block; }}
+#sig {{ layer: popup; position: absolute; width: auto; height: 1; background: {C.surface}; padding: 0 1; display: none; }}
+#sig.show {{ display: block; }}
+"""
+
+
+class Pytobs(App[None]):
+    TITLE = "pytobs"
+    CSS = CSS
+    COMMAND_PALETTE_BINDING = "ctrl+k"
+    BINDINGS = [
+        Binding("ctrl+r,f5", "run", "Run", priority=True),
+        Binding("ctrl+c", "ctrl_c", "Stop / copy", priority=True, show=False),
+        Binding("ctrl+e", "jump_error", "Jump to error", priority=True),
+        Binding("ctrl+s", "save", "Save", priority=True),
+        Binding("ctrl+o,ctrl+p", "open", "Open file", priority=True),
+        Binding("ctrl+n", "new_scratch", "New scratch", priority=True),
+        Binding("alt+f,f8", "format", "Format", priority=True),
+        Binding("ctrl+l", "clear_output", "Clear output", priority=True),
+        Binding("ctrl+b", "toggle_layout", "Layout", priority=True),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+    ]
+
+    def __init__(self, path: Path | None = None, python: str | None = None) -> None:
+        super().__init__()
+        self.cfg = Config.load()
+        self.session = Session.load()
+        self.python_override = python or self.cfg.python
+        self.file_path: Path | None = path
+        self.saved_text = ""
+        self.interp: Interpreter | None = None
+        self.py_version: str | None = None
+        self.current: Run | None = None
+        self.run_count = 0
+        self.last_run: tuple[int, float] | None = None  # exit code, seconds
+        self.error_jump: int | None = None
+        self._stderr_buffer: list[str] | None = None
+        self.diags: list[lint.Diagnostic] = []
+        self.completion = CompletionClient()
+        self._comp_gen = 0
+        self._comp_items: list[dict] = []
+        self._comp_view: list[dict] = []
+        self._comp_sel = 0
+        self._comp_start: tuple[int, int] | None = None
+        self._doc_gen = 0
+        self._debouncers: dict[str, Timer] = {}
+        self._layout_forced: str | None = None
+        self._stopped = False
+        self.register_theme(APP_THEME)
+        self.theme = "sumi"
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="main"):
+            with Vertical(id="editor-col"):
+                yield Static(id="tabline")
+                yield CodeEditor(id="editor")
+            with Vertical(id="output-col"):
+                yield Static(id="runhead")
+                yield OutputLog(id="output")
+                yield Input(id="stdin", placeholder="type input for the program, Enter to send")
+        yield Static(id="status")
+        with Horizontal(id="popup"):
+            yield Static(id="menu")
+            yield Static(id="doc")
+        yield Static(id="sig")
+
+    @property
+    def editor(self) -> CodeEditor:
+        return self.query_one(CodeEditor)
+
+    @property
+    def output(self) -> OutputLog:
+        return self.query_one(OutputLog)
+
+    def on_mount(self) -> None:
+        path = self.file_path
+        if path is None and self.session.last_file and Path(self.session.last_file).exists():
+            path = Path(self.session.last_file)
+        if path is None:
+            path = new_scratch_path()
+        self.open_file(path, initial=True)
+        self._show_welcome()
+        self.editor.focus()
+        self._apply_layout()
+        self.call_after_refresh(self._after_first_paint)
+
+    def _show_welcome(self) -> None:
+        out = self.output
+        out.clear()
+        out.add_line(Text("Write some Python, then", style=C.muted))
+        out.add_line(Text(""))
+        for key, label in (
+            ("Ctrl+R", "run"),
+            ("Ctrl+E", "jump to an error"),
+            ("Ctrl+P", "open a file"),
+            ("Ctrl+N", "new scratch file"),
+            ("Ctrl+K", "all commands"),
+        ):
+            line = Text()
+            line.append(f"{key:<8}", style=C.text)
+            line.append(label, style=C.muted)
+            out.add_line(line)
+
+    def _after_first_paint(self) -> None:
+        self.editor.enable_highlighting()
+        self.detect_interpreter()
+        self.schedule_lint(0.2)
+
+    def on_resize(self) -> None:
+        self._apply_layout()
+        self.hide_popups()
+
+    def _apply_layout(self) -> None:
+        stacked = self._layout_forced == "stacked" or (self._layout_forced is None and self.size.width < 100)
+        self.screen.set_class(stacked, "stacked")
+
+    def action_toggle_layout(self) -> None:
+        current = self.screen.has_class("stacked")
+        self._layout_forced = "side" if current else "stacked"
+        self._apply_layout()
+
+    # ── files ────────────────────────────────────────────────────────────────
+
+    def open_file(self, path: Path, initial: bool = False) -> None:
+        if not initial:
+            self.save()
+            self.remember_cursor()
+        path = path.expanduser()
+        try:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except (OSError, UnicodeDecodeError) as exc:
+            self.notify(f"Can't open {path.name}: {exc}", severity="error")
+            return
+        if not path.exists():
+            try:
+                atomic_write(path, "")
+            except OSError as exc:
+                self.notify(f"Can't create {path}: {exc}", severity="error")
+                return
+        self.file_path = path.resolve()
+        editor = self.editor
+        editor.load_text(text)
+        if not initial:
+            editor.enable_highlighting()
+        self.saved_text = text
+        cursor = self.session.cursors.get(str(self.file_path))
+        if cursor:
+            row = min(cursor[0], editor.document.line_count - 1)
+            editor.move_cursor((row, cursor[1]), center=True)
+        self.session.last_file = str(self.file_path)
+        self.session.save()
+        self.error_jump = None
+        editor.set_error_line(None)
+        self.diags = []
+        editor.set_diagnostics([])
+        self.hide_popups()
+        if not initial:
+            self.detect_interpreter()
+            self.schedule_lint(0.1)
+        self.refresh_chrome()
+
+    def remember_cursor(self) -> None:
+        if self.file_path:
+            self.session.cursors[str(self.file_path)] = list(self.editor.cursor_location)
+            self.session.save()
+
+    @property
+    def dirty(self) -> bool:
+        return self.editor.text != self.saved_text
+
+    def save(self) -> bool:
+        if not self.file_path or not self.dirty:
+            return True
+        text = self.editor.text
+        try:
+            atomic_write(self.file_path, text)
+        except OSError as exc:
+            self.notify(f"Couldn't save: {exc}", severity="error")
+            return False
+        self.saved_text = text
+        self.refresh_chrome()
+        return True
+
+    def action_save(self) -> None:
+        if self.cfg.format_on_save:
+            self.run_worker(self._format_then_save(), exclusive=True, group="format")
+        else:
+            self.save()
+
+    async def _format_then_save(self) -> None:
+        await self._format()
+        self.save()
+
+    def action_new_scratch(self) -> None:
+        self.open_file(new_scratch_path())
+
+    def action_open(self) -> None:
+        if not CommandPalette.is_open(self):
+            self.push_screen(_palette([FileProvider], "Open a file…"))
+
+    # ── chrome: tab line, run header, status bar ─────────────────────────────
+
+    def refresh_chrome(self) -> None:
+        self._render_tabline()
+        self._render_runhead()
+        self._render_status()
+
+    def _render_tabline(self) -> None:
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if self.file_path:
+            t.append(self.file_path.name, style=C.text)
+            if self.dirty:
+                t.append(f"  {G.dot}", style=C.muted)
+            if self.file_path.parent == scratch_dir().resolve():
+                t.append("   scratch", style=C.faint)
+        self.query_one("#tabline", Static).update(t)
+
+    def _render_runhead(self) -> None:
+        t = Text(no_wrap=True, overflow="ellipsis")
+        run = self.current
+        if run and not run.finished:
+            frame = G.spinner[int(time.monotonic() * 8) % len(G.spinner)]
+            t.append(f"{frame} ", style=C.accent)
+            t.append("running", style=C.text)
+            t.append(f"   {run.elapsed:5.1f}s", style=C.muted)
+            t.append("     ^C stop", style=C.faint)
+        elif self.last_run:
+            code, seconds = self.last_run
+            t.append(f"{G.run} ", style=C.accent)
+            t.append(f"run {self.run_count}", style=C.text)
+            t.append(f"   {_fmt_seconds(seconds)}", style=C.muted)
+            if self._stopped:
+                t.append("   stopped", style=C.muted)
+            else:
+                t.append("   exit ", style=C.muted)
+                t.append(str(code), style=C.ok if code == 0 else C.error)
+        else:
+            t.append("output", style=C.muted)
+            t.append("   ^R to run", style=C.faint)
+        self.query_one("#runhead", Static).update(t)
+
+    def _render_status(self) -> None:
+        editor = self.editor
+        row, col = editor.cursor_location
+        width = self.size.width - 4
+        left = Text(no_wrap=True, overflow="ellipsis")
+        if self.file_path:
+            left.append(short_path(self.file_path), style=C.text)
+        if self.interp:
+            label = f"py {self.py_version}" if self.py_version else "py"
+            venv = self.interp.source if self.interp.source in (".venv", "venv", "env") else None
+            left.append(f"   {label}", style=C.muted)
+            if venv:
+                left.append(f" {G.sep} {venv}", style=C.muted)
+        diag = editor.diagnostics.get(row)
+        mid = Text(no_wrap=True, overflow="ellipsis")
+        if diag:
+            mid.append(f"{diag.code} ", style=C.error if diag.error else C.warn)
+            mid.append(diag.message, style=C.text)
+        elif self.diags:
+            n = len(self.diags)
+            errors = sum(d.error for d in self.diags)
+            mid.append(f"{G.dot} ", style=C.error if errors else C.warn)
+            mid.append(f"{n} problem{'s' if n != 1 else ''}", style=C.muted)
+        else:
+            mid.append(f"{G.dot} ", style=C.ok)
+            mid.append("ruff", style=C.muted)
+        right = Text(no_wrap=True)
+        right.append(f"Ln {row + 1:<4} Col {col + 1:<3}", style=C.muted)
+        hints = Text(no_wrap=True)
+        for key, label in (("^R", "run"), ("^P", "open"), ("^K", "menu")):
+            hints.append("   ")
+            hints.append(key, style=C.text)
+            hints.append(f" {label}", style=C.muted)
+        if width > 110:
+            right.append_text(hints)
+        gap = 3
+        room = width - right.cell_len - gap
+        left.truncate(max(10, min(left.cell_len, room // 2)), overflow="ellipsis")
+        room_mid = max(0, room - left.cell_len - gap)
+        mid.truncate(room_mid, overflow="ellipsis")
+        pad = max(1, width - left.cell_len - mid.cell_len - right.cell_len - gap)
+        line = Text(no_wrap=True)
+        line.append_text(left)
+        line.append(" " * gap)
+        line.append_text(mid)
+        line.append(" " * pad)
+        line.append_text(right)
+        self.query_one("#status", Static).update(line)
+
+    # ── editor events ────────────────────────────────────────────────────────
+
+    @on(TextArea.Changed, "#editor")
+    def _on_edit(self) -> None:
+        self._render_tabline()
+        if self.editor.error_line is not None:
+            self.editor.set_error_line(None)
+        if self.cfg.autosave:
+            self._debounce("autosave", 1.0, self.save)
+        self.schedule_lint(0.5)
+
+    @on(TextArea.SelectionChanged, "#editor")
+    def _on_cursor(self) -> None:
+        self._render_status()
+        start = self._comp_start
+        if start is not None:
+            row, col = self.editor.cursor_location
+            if row != start[0] or col < start[1]:
+                self.hide_popups()
+        sig = self.query_one("#sig")
+        if sig.has_class("show") and self.editor.cursor_location[0] != getattr(self, "_sig_row", -1):
+            sig.remove_class("show")
+
+    @on(CodeEditor.Typed)
+    def _on_typed(self, event: CodeEditor.Typed) -> None:
+        char = event.char
+        if char in "(,":
+            self._debounce("sig", 0.05, self.request_signature)
+        elif char == ")":
+            self.query_one("#sig").remove_class("show")
+        word, _ = self.editor.current_word()
+        if char == ".":
+            self.request_completion()
+        elif char.isalnum() or char == "_":
+            if self._comp_items and self._comp_start is not None:
+                self._filter_completion()
+                if not self._comp_view:
+                    self.hide_completion()
+            if len(word) >= 2 and not self._comp_view:
+                self._debounce("complete", 0.06, self.request_completion)
+        else:
+            self.hide_completion()
+
+    @on(CodeEditor.PopupKey)
+    def _on_popup_key(self, event: CodeEditor.PopupKey) -> None:
+        key = event.key
+        menu_open = self.query_one("#popup").has_class("show")
+        if key == "escape" or not menu_open:
+            self.hide_popups()
+            return
+        if key in ("down", "up", "pagedown", "pageup"):
+            step = {"down": 1, "up": -1, "pagedown": 8, "pageup": -8}[key]
+            self._comp_sel = (self._comp_sel + step) % max(1, len(self._comp_view))
+            self._render_menu()
+            self._debounce("doc", 0.12, self.request_doc)
+        elif key in ("tab", "enter"):
+            self.accept_completion()
+
+    # ── completion ───────────────────────────────────────────────────────────
+
+    @work(group="interp", exclusive=True)
+    async def detect_interpreter(self) -> None:
+        interp = await asyncio.to_thread(find_interpreter, self.file_path, self.python_override)
+        changed = interp != self.interp
+        self.interp = interp
+        if changed or not self.py_version:
+            self.py_version = await asyncio.to_thread(interpreter_version, interp.executable)
+            self._render_status()
+        if changed or not self.completion.alive:
+            try:
+                await self.completion.start(interp.executable)
+                await self.completion.request(
+                    "warm", source=self.editor.text, path=str(self.file_path), timeout=30
+                )
+            except OSError:
+                pass
+
+    def request_completion(self) -> None:
+        self._comp_gen += 1
+        gen = self._comp_gen
+        editor = self.editor
+        row, col = editor.cursor_location
+        _, start = editor.current_word()
+        self._comp_start = start
+        self._fetch_completion(gen, editor.text, row + 1, col, start)
+
+    @work(group="complete")
+    async def _fetch_completion(
+        self, gen: int, source: str, line: int, col: int, start: tuple[int, int]
+    ) -> None:
+        items = await self.completion.request(
+            "complete", source=source, line=line, col=col, path=str(self.file_path), timeout=8
+        )
+        if gen != self._comp_gen or not items:
+            if gen == self._comp_gen:
+                self.hide_completion()
+            return
+        self._comp_items = items
+        self._comp_start = start
+        self._filter_completion()
+
+    def _filter_completion(self) -> None:
+        word, start = self.editor.current_word()
+        if self._comp_start != start:
+            self._comp_start = start
+        lw = word.lower()
+        if lw:
+            prefix = [i for i in self._comp_items if i["name"].lower().startswith(lw)]
+            contains = [i for i in self._comp_items if lw in i["name"].lower() and i not in prefix]
+            view = prefix + contains
+        else:
+            view = [i for i in self._comp_items if not i["name"].startswith("_")] or self._comp_items
+        if len(view) == 1 and view[0]["name"] == word:
+            view = []
+        self._comp_view = view[:100]
+        self._comp_sel = 0
+        if self._comp_view:
+            self._render_menu()
+            self._debounce("doc", 0.12, self.request_doc)
+        else:
+            self.hide_completion()
+
+    def _render_menu(self) -> None:
+        view = self._comp_view
+        rows = 8
+        top = max(0, min(self._comp_sel - rows + 1, len(view) - rows)) if self._comp_sel >= rows else 0
+        shown = view[top : top + rows]
+        width = min(40, max(14, max(len(i["name"]) for i in shown) + 4))
+        t = Text(no_wrap=True)
+        for idx, item in enumerate(shown, start=top):
+            selected = idx == self._comp_sel
+            bg = C.overlay if selected else C.surface
+            t.append("▌" if selected else " ", style=Style(color=C.accent, bgcolor=bg))
+            name = item["name"]
+            if len(name) > width - 4:
+                name = name[: width - 5] + "…"
+            t.append(f"{name:<{width - 4}}", style=Style(color=C.text, bgcolor=bg, bold=selected))
+            t.append(f" {item['kind']} ", style=Style(color=C.muted, bgcolor=bg))
+            if idx != top + len(shown) - 1:
+                t.append("\n")
+        self.query_one("#menu", Static).update(t)
+        popup = self.query_one("#popup")
+        popup.add_class("show")
+        self.editor.popup_open = True
+        self._position_popup(width, len(shown))
+
+    def _position_popup(self, width: int, height: int) -> None:
+        editor = self.editor
+        cursor = editor.cursor_screen_offset
+        word, _ = editor.current_word()
+        x = max(0, cursor.x - len(word) - 1)
+        y = cursor.y + 1
+        if y + height >= self.size.height - 1:
+            y = max(0, cursor.y - height)
+        x = min(x, max(0, self.size.width - width - 1))
+        self.query_one("#popup").styles.offset = (x, y)
+
+    def request_doc(self) -> None:
+        if not self._comp_view:
+            return
+        self._doc_gen += 1
+        self._fetch_doc(self._doc_gen, self._comp_view[self._comp_sel]["name"])
+
+    @work(group="doc")
+    async def _fetch_doc(self, gen: int, name: str) -> None:
+        info = await self.completion.request("doc", name=name, timeout=5)
+        doc = self.query_one("#doc", Static)
+        if gen != self._doc_gen or not self.query_one("#popup").has_class("show"):
+            return
+        if not info or not (info.get("signatures") or info.get("doc")):
+            doc.remove_class("show")
+            return
+        t = Text()
+        for sig in info.get("signatures", []):
+            t.append(sig + "\n", style=C.callable)
+        if info.get("doc"):
+            if info.get("signatures"):
+                t.append("\n")
+            t.append(info["doc"], style=C.muted)
+        t.rstrip()
+        popup = self.query_one("#popup")
+        menu_width = self.query_one("#menu").size.width
+        room = self.size.width - int(popup.styles.offset.x.value) - menu_width - 6
+        if room < 30:
+            doc.remove_class("show")
+            return
+        doc.styles.max_width = min(64, room)
+        doc.styles.max_height = max(4, self.size.height - int(popup.styles.offset.y.value) - 2)
+        doc.update(t)
+        doc.add_class("show")
+
+    def accept_completion(self) -> None:
+        if not self._comp_view:
+            self.hide_completion()
+            return
+        name = self._comp_view[self._comp_sel]["name"]
+        editor = self.editor
+        _, start = editor.current_word()
+        end = editor.cursor_location
+        editor.replace(name, start, end)
+        editor.move_cursor((start[0], start[1] + len(name)))
+        self.hide_completion()
+
+    def hide_completion(self) -> None:
+        self._comp_gen += 1
+        self._comp_items = []
+        self._comp_view = []
+        self._comp_start = None
+        self.query_one("#popup").remove_class("show")
+        self.query_one("#doc").remove_class("show")
+        self.editor.popup_open = False
+
+    def hide_popups(self) -> None:
+        self.hide_completion()
+        self.query_one("#sig").remove_class("show")
+
+    def request_signature(self) -> None:
+        editor = self.editor
+        row, col = editor.cursor_location
+        self._fetch_signature(editor.text, row + 1, col, row)
+
+    @work(group="sig", exclusive=True)
+    async def _fetch_signature(self, source: str, line: int, col: int, row: int) -> None:
+        sig = await self.completion.request(
+            "signature", source=source, line=line, col=col, path=str(self.file_path), timeout=5
+        )
+        box = self.query_one("#sig", Static)
+        if not sig or self.editor.cursor_location[0] != row:
+            box.remove_class("show")
+            return
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append(sig["name"], style=C.callable)
+        t.append("(", style=C.muted)
+        for i, p in enumerate(sig["params"]):
+            if i:
+                t.append(", ", style=C.muted)
+            t.append(p, style=Style(color=C.accent, bold=True) if i == sig.get("index") else C.muted)
+        t.append(")", style=C.muted)
+        cursor = self.editor.cursor_screen_offset
+        width = min(t.cell_len + 2, 84, self.size.width - 2)
+        box.styles.max_width = width
+        x = min(max(0, cursor.x - 4), self.size.width - width - 1)
+        y = cursor.y - 1 if cursor.y > 1 else cursor.y + 1
+        box.update(t)
+        box.styles.offset = (x, y)
+        self._sig_row = row
+        box.add_class("show")
+
+    # ── lint and format ──────────────────────────────────────────────────────
+
+    def schedule_lint(self, delay: float) -> None:
+        self._debounce("lint", delay, self._lint)
+
+    def _lint(self) -> None:
+        if self.file_path:
+            self._run_lint(self.editor.text, self.file_path)
+
+    @work(group="lint", exclusive=True)
+    async def _run_lint(self, source: str, path: Path) -> None:
+        diags = await lint.check(source, path)
+        if source != self.editor.text:
+            return
+        self.diags = diags
+        self.editor.set_diagnostics(diags)
+        self._render_status()
+
+    def action_format(self) -> None:
+        self.run_worker(self._format(), exclusive=True, group="format")
+
+    async def _format(self) -> None:
+        if not self.file_path:
+            return
+        source = self.editor.text
+        formatted = await lint.format_source(source, self.file_path)
+        if formatted is None:
+            self.notify("Can't format: fix the syntax error first.", severity="warning")
+            return
+        if formatted != source and self.editor.text == source:
+            row, col = self.editor.cursor_location
+            self.editor.replace(formatted, (0, 0), self.editor.document.end)
+            row = min(row, self.editor.document.line_count - 1)
+            self.editor.move_cursor((row, col))
+
+    # ── running ──────────────────────────────────────────────────────────────
+
+    def action_run(self) -> None:
+        self.hide_popups()
+        if not self.save() or not self.file_path:
+            return
+        self.run_worker(self._start_run(), exclusive=True, group="run")
+
+    async def _start_run(self) -> None:
+        if self.current and not self.current.finished:
+            await self.current.stop(grace=0.5)
+        if not self.interp:
+            self.interp = await asyncio.to_thread(find_interpreter, self.file_path, self.python_override)
+        assert self.file_path
+        self.output.clear()
+        self.error_jump = None
+        self.editor.set_error_line(None)
+        self._stderr_buffer = None
+        self.run_count += 1
+        self.current = Run(self.interp.executable, self.file_path, self._on_run_output, self._on_run_exit)
+        stdin = self.query_one("#stdin", Input)
+        stdin.value = ""
+        stdin.add_class("show")
+        stdin.focus()  # typing goes to the program while it runs; Esc returns to the editor
+        self._stopped = False
+        self._debouncers["tick"] = self.set_interval(1 / 8, self._render_runhead)
+        await self.current.start()
+        self._render_runhead()
+
+    def _on_run_output(self, text: str, stream: str) -> None:
+        if stream == "stderr":
+            if self._stderr_buffer is not None:
+                self._stderr_buffer.append(text)
+                return
+            first = text.lstrip("\n").split("\n", 1)[0]
+            if tracebacks.looks_like_error_start(first):
+                self._stderr_buffer = [text]
+                return
+            self.output.write(text, Style(color=C.error, dim=True))
+        else:
+            self.output.write(text, "")
+
+    def _on_run_exit(self, code: int, seconds: float) -> None:
+        self.last_run = (code, seconds)
+        timer = self._debouncers.pop("tick", None)
+        if timer:
+            timer.stop()
+        stdin = self.query_one("#stdin", Input)
+        if stdin.has_focus:
+            self.editor.focus()
+        stdin.remove_class("show")
+        if self._stopped:
+            self._stderr_buffer = None
+            self.output.ensure_newline()
+            self.output.add_line(Text(f"{G.cross} stopped", style=C.muted))
+        elif self._stderr_buffer is not None:
+            self._show_error("".join(self._stderr_buffer))
+            self._stderr_buffer = None
+        elif code not in (0, -1):
+            self.output.ensure_newline()
+        self._render_runhead()
+
+    def _show_error(self, raw: str) -> None:
+        out = self.output
+        assert self.file_path
+        err = tracebacks.parse(raw)
+        if err is None:
+            out.write(raw, Style(color=C.error))
+            return
+        out.ensure_newline()
+        if out.has_content:
+            out.add_line(Text(""))
+        exc = err.exception
+        name, sep, msg = exc.partition(":")
+        head = Text()
+        head.append(f"{G.cross} ", style=C.error)
+        head.append(name, style=Style(color=C.error, bold=True))
+        if sep:
+            head.append(":" + msg, style=C.text)
+        out.add_line(head)
+        for extra in err.message[1:]:
+            out.add_line(Text("  " + extra, style=C.muted))
+        out.add_line(Text(""))
+        frames = err.frames
+        user = [f for f in frames if tracebacks.is_user_frame(f, self.file_path)]
+        hidden = len(frames) - len(user)
+        for frame in user[-4:]:
+            loc = Text()
+            loc.append(f"{Path(frame.file).name}:{frame.line}", style=Style(color=C.accent, underline=True))
+            if frame.func:
+                loc.append(f"  in {frame.func}", style=C.muted)
+            same_file = _same_file(frame.file, self.file_path)
+            out.add_line(loc, jump=frame.line if same_file else None)
+            for i, code_line in enumerate(frame.code):
+                marker = i > 0 and set(code_line.strip()) <= set("^~ ")
+                out.add_line(Text("  " + code_line, style=C.error if marker else C.text))
+        if hidden:
+            out.add_line(Text(f"+ {hidden} library frame{'s' if hidden != 1 else ''} hidden", style=C.faint))
+        self.error_jump = tracebacks.jump_target(err, self.file_path)
+        if self.error_jump:
+            out.add_line(Text(""))
+            hint = Text()
+            hint.append("^E", style=C.text)
+            hint.append(f"  jump to line {self.error_jump}", style=C.muted)
+            out.add_line(hint, jump=self.error_jump)
+            self.editor.set_error_line(self.error_jump - 1)
+
+    @on(Input.Submitted, "#stdin")
+    def _send_input(self, event: Input.Submitted) -> None:
+        if self.current and not self.current.finished:
+            self.output.write(event.value + "\n", Style(color=C.accent))
+            self.current.send_input(event.value + "\n")
+        event.input.value = ""
+
+    @on(OutputLog.Jump)
+    def _jump(self, event: OutputLog.Jump) -> None:
+        self._jump_to(event.line)
+
+    def action_jump_error(self) -> None:
+        if self.error_jump:
+            self._jump_to(self.error_jump)
+
+    def _jump_to(self, line: int) -> None:
+        editor = self.editor
+        row = max(0, min(line - 1, editor.document.line_count - 1))
+        text = editor.document[row]
+        editor.move_cursor((row, len(text) - len(text.lstrip())), center=True)
+        editor.focus()
+
+    def action_stop(self) -> None:
+        if self.current and not self.current.finished:
+            self._stopped = True
+            self.run_worker(self.current.stop(), group="stop")
+
+    def action_ctrl_c(self) -> None:
+        running = self.current is not None and not self.current.finished
+        focused = self.focused
+        if isinstance(focused, CodeEditor) and not focused.selection.is_empty:
+            focused.action_copy()
+            return
+        if running:
+            self.action_stop()
+        elif isinstance(focused, Input) and focused.selected_text:
+            self.copy_to_clipboard(focused.selected_text)
+
+    def action_clear_output(self) -> None:
+        self.output.clear()
+
+    def on_key(self, event) -> None:
+        if event.key == "ctrl+d" and isinstance(self.focused, Input) and self.focused.id == "stdin":
+            if self.current:
+                self.current.close_input()
+            event.stop()
+        elif event.key == "escape" and isinstance(self.focused, Input):
+            self.editor.focus()
+
+    # ── commands ─────────────────────────────────────────────────────────────
+
+    def action_command_palette(self) -> None:
+        if not CommandPalette.is_open(self):
+            self.push_screen(Palette(id="--command-palette", placeholder="Run a command…"))
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        yield SystemCommand("Run", "Save and run this file  (Ctrl+R)", self.action_run)
+        yield SystemCommand("Stop", "Stop the running program  (Ctrl+C)", self.action_stop)
+        yield SystemCommand("Open file", "Open a file in this folder  (Ctrl+P)", self.action_open)
+        yield SystemCommand(
+            "New scratch file", "Start a fresh scratch file  (Ctrl+N)", self.action_new_scratch
+        )
+        yield SystemCommand("Format file", "Format with ruff  (Alt+F)", self.action_format)
+        yield SystemCommand("Jump to error", "Cursor to the failing line  (Ctrl+E)", self.action_jump_error)
+        yield SystemCommand("Clear output", "Empty the output pane  (Ctrl+L)", self.action_clear_output)
+        yield SystemCommand(
+            "Toggle layout", "Output beside or below the editor  (Ctrl+B)", self.action_toggle_layout
+        )
+        yield SystemCommand("Save", "Save now (autosave is on)  (Ctrl+S)", self.action_save)
+        yield SystemCommand("Quit", "Save and quit  (Ctrl+Q)", self.action_quit)
+
+    async def action_quit(self) -> None:
+        self.save()
+        self.remember_cursor()
+        if self.current and not self.current.finished:
+            await self.current.stop(grace=0.3)
+        await self.completion.close()
+        self.exit()
+
+    # ── utilities ────────────────────────────────────────────────────────────
+
+    def _debounce(self, name: str, delay: float, callback) -> None:
+        timer = self._debouncers.pop(name, None)
+        if timer:
+            timer.stop()
+        self._debouncers[name] = self.set_timer(delay, callback)
+
+
+class Palette(CommandPalette):
+    """The command palette, restyled as a compact floating panel."""
+
+    DEFAULT_CSS = f"""
+    Palette {{ background: {C.base} 55%; }}
+    Palette > Vertical {{ width: 76; max-width: 92%; margin-top: 3; }}
+    Palette #--input {{ border: none; background: {C.surface}; padding: 0 1; height: 3; }}
+    Palette #--input.--list-visible {{ border: none; }}
+    Palette SearchIcon {{ color: {C.accent}; margin: 1 0 0 1; width: 2; }}
+    Palette CommandInput, Palette CommandInput:focus {{
+        border: none; background: {C.surface}; padding: 1 1 1 0; height: 3;
+    }}
+    Palette CommandList, Palette CommandList:focus {{
+        border: none; background: {C.surface}; padding: 0 0 1 0; max-height: 18;
+    }}
+    Palette CommandList > .option-list--option {{ padding: 0 2; }}
+    Palette CommandList > .option-list--option-highlighted {{ background: {C.overlay}; }}
+    Palette > .command-palette--help-text {{ color: {C.muted}; text-style: not bold; }}
+    Palette > .command-palette--highlight {{ color: {C.accent}; text-style: bold; }}
+    """
+
+    def on_mount(self) -> None:
+        self.query_one(SearchIcon).icon = G.chevron
+
+
+def _palette(providers, placeholder: str) -> Palette:
+    return Palette(providers=providers, placeholder=placeholder)
+
+
+def _same_file(a: str, b: Path) -> bool:
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(b.resolve()))
+    except OSError:
+        return False
+
+
+def _fmt_seconds(seconds: float) -> str:
+    if seconds < 10:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
