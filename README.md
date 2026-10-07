@@ -53,7 +53,10 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | **Ctrl+G** | Your progress: streak, runs, coding time, errors you meet most |
 | **Ctrl+C** | Stop the program (copies instead when text is selected) |
 | **Ctrl+E** | Jump to the line that raised the error |
-| **Ctrl+P** | Open a file in this folder |
+| **Ctrl+P** | Open a file in this folder (opens in a new tab; open files are listed first) |
+| **Alt+← / Alt+→** or **Ctrl+PgUp / Ctrl+PgDn** | Previous / next open file |
+| **Alt+1 … Alt+9** | Jump to open file 1–9 |
+| **Ctrl+W** | Close the file in focus (click × or middle-click a tab too) |
 | **Ctrl+N** | New scratch file |
 | **Ctrl+K** | All commands, including Install a package |
 | **Alt+F** or **F8** | Format with ruff |
@@ -69,6 +72,9 @@ Files save automatically one second after you stop typing.
 ## What it does
 
 - **Runs your code in its own process** with your project's Python: the nearest `.venv`, then the `py` launcher, then `python` on PATH. The interpreter is shown in the status bar.
+- **Several files open, one in focus.** Every file you open gets a tab along the top; the focused one
+  blends into the editor and an accent dot marks unsaved changes. Each tab keeps its own cursor, scroll
+  position and undo history, and your open tabs come back the next time you start pytobs.
 - **Live output and input.** `input()` works: type in the box under the output.
 - **Readable errors.** The exception first, then your line with Python's own markers. Library frames are hidden. Click the location or press Ctrl+E to jump there.
 - **Suggestions as you type** (Jedi, in a separate process so typing never waits), with signature and docs beside the list.

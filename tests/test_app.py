@@ -129,3 +129,61 @@ async def test_progress_screen_opens(tmp_path: Path) -> None:
         assert type(app.screen).__name__ == "ProgressScreen"
         await pilot.press("escape")
         assert type(app.screen).__name__ != "ProgressScreen"
+
+
+async def test_tabs_keep_their_own_text_cursor_and_undo(tmp_path: Path) -> None:
+    a, b = tmp_path / "a.py", tmp_path / "b.py"
+    a.write_text("x = 1\n")
+    b.write_text("y = 2\n")
+    app = Pytobs(path=a, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.open_file(b)
+        await pilot.pause()
+        assert [t.path.name for t in app.tabs] == ["a.py", "b.py"] and app.active == 1
+        app.editor.move_cursor((0, 5))
+        await pilot.press("9")
+        assert app.editor.text == "y = 29\n"
+        await pilot.press("alt+left")
+        assert app.file_path == a.resolve() and app.editor.text == "x = 1\n"
+        assert b.read_text() == "y = 29\n"  # saved when switching away
+        await pilot.press("alt+right")
+        assert app.editor.text == "y = 29\n" and app.editor.cursor_location == (0, 6)
+        await pilot.press("ctrl+z")
+        assert app.editor.text == "y = 2\n"  # undo history survived the switch
+        app.open_file(a)  # already open: just focuses it, no duplicate tab
+        assert len(app.tabs) == 2 and app.active == 0
+
+
+async def test_close_tab_and_click_tab(tmp_path: Path) -> None:
+    files = [tmp_path / f"f{i}.py" for i in range(3)]
+    for f in files:
+        f.write_text(f"# {f.name}\n")
+    app = Pytobs(path=files[0], python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.open_file(files[1])
+        app.open_file(files[2])
+        await pilot.pause()
+        await pilot.press("alt+1")
+        assert app.active == 0
+        bar = app.query_one("TabBar")
+        x0, _, index, _ = next(h for h in bar.hits if h[2] == 2 and not h[3])
+        await pilot.click("#tabline", offset=(x0 + 2, 0))
+        assert app.active == 2
+        await pilot.press("ctrl+w")
+        assert [t.path.name for t in app.tabs] == ["f0.py", "f1.py"] and app.active == 1
+        await pilot.press("ctrl+w", "ctrl+w")
+        assert len(app.tabs) == 1 and "scratch" in str(app.file_path)  # never zero tabs
+
+
+async def test_open_tabs_come_back_next_time(tmp_path: Path) -> None:
+    a, b = tmp_path / "a.py", tmp_path / "b.py"
+    a.write_text("")
+    b.write_text("")
+    app = Pytobs(path=a, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.open_file(b)
+        await pilot.press("alt+left")
+    again = Pytobs(python=sys.executable)
+    async with again.run_test(size=(120, 30)):
+        assert [t.path.name for t in again.tabs] == ["a.py", "b.py"]
+        assert again.file_path == a.resolve()

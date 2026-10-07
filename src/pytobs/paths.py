@@ -77,6 +77,7 @@ class Config:
 class Session:
     last_file: str | None = None
     cursors: dict[str, list[int]] = field(default_factory=dict)
+    open_files: list[str] = field(default_factory=list)
 
     @staticmethod
     def path() -> Path:
@@ -86,7 +87,11 @@ class Session:
     def load(cls) -> Session:
         try:
             data = json.loads(cls.path().read_text(encoding="utf-8"))
-            return cls(last_file=data.get("last_file"), cursors=dict(data.get("cursors", {})))
+            return cls(
+                last_file=data.get("last_file"),
+                cursors=dict(data.get("cursors", {})),
+                open_files=[str(f) for f in data.get("open_files", [])],
+            )
         except (OSError, ValueError):
             return cls()
 
@@ -95,6 +100,7 @@ class Session:
         if len(self.cursors) > 200:
             self.cursors = dict(list(self.cursors.items())[-200:])
         try:
-            atomic_write(self.path(), json.dumps({"last_file": self.last_file, "cursors": self.cursors}))
+            payload = {"last_file": self.last_file, "cursors": self.cursors, "open_files": self.open_files}
+            atomic_write(self.path(), json.dumps(payload))
         except OSError:
             pass

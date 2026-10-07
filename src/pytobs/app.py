@@ -7,19 +7,23 @@ import json
 import os
 import time
 from collections.abc import Iterable
+import dataclasses
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 from rich.style import Style
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.command import CommandPalette, DiscoveryHit, Hit, Hits, Provider, SearchIcon
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
+from textual.message import Message
 from textual.widgets import Input, Static, TextArea
+from textual.widgets.text_area import Selection
 
 from . import explain, lint, packages, tracebacks
 from .completion.client import CompletionClient
@@ -92,6 +96,10 @@ class FileProvider(Provider):
             return short_path(p)
 
     async def discover(self) -> Hits:
+        app = self.app
+        if isinstance(app, Pytobs):
+            for tab in app.tabs:
+                yield DiscoveryHit(f"{self._label(tab.path)}   open", partial(self._open, tab.path))
         for p in self._cache[:40]:
             yield DiscoveryHit(self._label(p), partial(self._open, p), help=None)
 
@@ -109,11 +117,46 @@ class FileProvider(Provider):
             app.open_file(p)
 
 
+MAX_RESTORED_TABS = 12
+
+
+@dataclass
+class Tab:
+    """An open file. The active tab's live state is in the editor; others keep theirs here."""
+
+    path: Path
+    text: str = ""
+    saved_text: str = ""
+    selection: Selection | None = None
+    scroll: tuple[float, float] = (0.0, 0.0)
+    history: object | None = None
+
+
+class TabBar(Static):
+    """One row of file tabs. Click a tab to focus it; click × or middle-click to close it."""
+
+    class Clicked(Message):
+        def __init__(self, index: int, close: bool) -> None:
+            super().__init__()
+            self.index = index
+            self.close = close
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.hits: list[tuple[int, int, int, bool]] = []  # (x0, x1, tab index, is close button)
+
+    def on_click(self, event: events.Click) -> None:
+        for x0, x1, index, close in self.hits:
+            if x0 <= event.x < x1:
+                self.post_message(self.Clicked(index, close or event.button == 2))
+                return
+
+
 CSS = f"""
 Screen {{ background: {C.base}; layers: base popup; }}
 #main {{ height: 1fr; }}
 #editor-col {{ width: 3fr; background: {C.base}; }}
-#tabline {{ height: 1; padding: 0 2; margin-bottom: 1; color: {C.muted}; background: {C.base}; }}
+#tabline {{ height: 1; margin-bottom: 1; color: {C.muted}; background: {C.mantle}; }}
 CodeEditor {{ border: none; padding: 0 1 0 0; background: {C.base}; height: 1fr; scrollbar-size-vertical: 1; scrollbar-size-horizontal: 0; }}
 CodeEditor:focus {{ border: none; }}
 #output-col {{ width: 2fr; min-width: 30; background: {C.mantle}; padding: 0 0 0 2; }}
@@ -150,6 +193,13 @@ class Pytobs(App[None]):
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("ctrl+o,ctrl+p", "open", "Open file", priority=True),
         Binding("ctrl+n", "new_scratch", "New scratch", priority=True),
+        Binding("ctrl+w", "close_tab", "Close file", priority=True),
+        Binding("ctrl+pagedown,alt+right", "next_tab", "Next file", priority=True),
+        Binding("ctrl+pageup,alt+left", "prev_tab", "Previous file", priority=True),
+        *[
+            Binding(f"alt+{n}", f"goto_tab({n - 1})", f"File {n}", priority=True, show=False)
+            for n in range(1, 10)
+        ],
         Binding("alt+f,f8", "format", "Format", priority=True),
         Binding("ctrl+l", "clear_output", "Clear output", priority=True),
         Binding("ctrl+b", "toggle_layout", "Layout", priority=True),
@@ -180,6 +230,8 @@ class Pytobs(App[None]):
         self._doc_gen = 0
         self._debouncers: dict[str, Timer] = {}
         self._layout_forced: str | None = None
+        self.tabs: list[Tab] = []
+        self.active = -1
         self.stats = Stats.load()
         self.mode = "run"  # what the current process is: "run", "trace" or "tests"
         self._result_path: Path | None = None
@@ -195,7 +247,7 @@ class Pytobs(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
             with Vertical(id="editor-col"):
-                yield Static(id="tabline")
+                yield TabBar(id="tabline")
                 yield CodeEditor(id="editor")
             with Vertical(id="output-col"):
                 yield Static(id="runhead")
@@ -217,12 +269,20 @@ class Pytobs(App[None]):
         return self.query_one(OutputLog)
 
     def on_mount(self) -> None:
-        path = self.file_path
-        if path is None and self.session.last_file and Path(self.session.last_file).exists():
-            path = Path(self.session.last_file)
-        if path is None:
-            path = new_scratch_path()
-        self.open_file(path, initial=True)
+        wanted = self.file_path
+        restore = [Path(f) for f in self.session.open_files if Path(f).is_file()][-MAX_RESTORED_TABS:]
+        last = Path(self.session.last_file) if self.session.last_file else None
+        for path in restore:
+            self._add_tab(path)
+        if wanted is not None:
+            target = wanted
+        elif last is not None and last.is_file():
+            target = last
+        elif self.tabs:
+            target = self.tabs[-1].path
+        else:
+            target = new_scratch_path()
+        self.open_file(target, initial=True)
         self._show_welcome()
         self.editor.focus()
         self._apply_layout()
@@ -239,7 +299,8 @@ class Pytobs(App[None]):
             ("F6", "watch it run, step by step"),
             ("Ctrl+T", "run tests"),
             ("Ctrl+E", "jump to an error"),
-            ("Ctrl+P", "open a file"),
+            ("Ctrl+P", "open a file in a new tab"),
+            ("Alt+← →", "switch between open files"),
             ("Ctrl+G", "your progress"),
             ("Ctrl+K", "all commands, install packages"),
         ):
@@ -255,6 +316,7 @@ class Pytobs(App[None]):
 
     def on_resize(self) -> None:
         self._apply_layout()
+        self.call_after_refresh(self._render_tabline)
         self.hide_popups()
 
     def _apply_layout(self) -> None:
@@ -268,34 +330,87 @@ class Pytobs(App[None]):
 
     # ── files ────────────────────────────────────────────────────────────────
 
-    def open_file(self, path: Path, initial: bool = False) -> None:
-        if not initial:
-            self.save()
-            self.remember_cursor()
-        path = path.expanduser()
+    def _tab_index(self, path: Path) -> int:
+        key = os.path.normcase(str(path))
+        for i, tab in enumerate(self.tabs):
+            if os.path.normcase(str(tab.path)) == key:
+                return i
+        return -1
+
+    def _add_tab(self, path: Path, at: int | None = None) -> int:
+        """Read a file into a new tab (created if missing). Returns its index, or -1 on failure."""
+        path = path.expanduser().resolve()
+        existing = self._tab_index(path)
+        if existing >= 0:
+            return existing
         try:
             text = path.read_text(encoding="utf-8-sig") if path.exists() else ""  # tolerate Notepad BOMs
         except (OSError, UnicodeDecodeError) as exc:
             self.notify(f"Can't open {path.name}: {exc}", severity="error")
-            return
+            return -1
         if not path.exists():
             try:
                 atomic_write(path, "")
             except OSError as exc:
                 self.notify(f"Can't create {path}: {exc}", severity="error")
-                return
-        self.file_path = path.resolve()
+                return -1
+        tab = Tab(path=path, text=text, saved_text=text)
+        index = len(self.tabs) if at is None else at
+        self.tabs.insert(index, tab)
+        if 0 <= self.active and index <= self.active:
+            self.active += 1
+        return index
+
+    def open_file(self, path: Path, initial: bool = False) -> None:
+        index = self._add_tab(path, at=None if self.active < 0 else self.active + 1)
+        if index >= 0:
+            self._activate(index, initial=initial)
+        elif not self.tabs:
+            self._activate(self._add_tab(new_scratch_path()), initial=initial)
+
+    def _stash(self) -> None:
+        """Copy the editor's live state into the active tab."""
+        if 0 <= self.active < len(self.tabs):
+            tab = self.tabs[self.active]
+            editor = self.editor
+            tab.text = editor.text
+            tab.saved_text = self.saved_text
+            tab.selection = editor.selection
+            tab.scroll = (editor.scroll_offset.x, editor.scroll_offset.y)
+            tab.history = editor.history
+
+    def _activate(self, index: int, initial: bool = False) -> None:
+        if not (0 <= index < len(self.tabs)):
+            return
+        if index == self.active and not initial:
+            self.editor.focus()
+            return
+        if self.active >= 0 and not initial:
+            self.save()
+            self.remember_cursor()
+            self._stash()
+        self.close_trace()
+        self.active = index
+        tab = self.tabs[index]
+        self.file_path = tab.path
         editor = self.editor
-        editor.load_text(text)
+        # load_text clears the editor's history object in place; detach the stashed one first
+        editor.history = dataclasses.replace(editor.history)
+        editor.load_text(tab.text)
+        if tab.history is not None:
+            editor.history = tab.history  # undo/redo survive switching files
         if not initial:
             editor.enable_highlighting()
-        self.saved_text = text
-        cursor = self.session.cursors.get(str(self.file_path))
-        if cursor:
-            row = min(cursor[0], editor.document.line_count - 1)
-            editor.move_cursor((row, cursor[1]), center=True)
-        self.session.last_file = str(self.file_path)
-        self.session.save()
+        self.saved_text = tab.saved_text
+        if tab.selection is not None:
+            editor.selection = tab.selection
+            editor.scroll_to(*tab.scroll, animate=False, immediate=True)
+        else:
+            cursor = self.session.cursors.get(str(tab.path))
+            if cursor:
+                row = min(cursor[0], editor.document.line_count - 1)
+                editor.move_cursor((row, cursor[1]), center=True)
+        self._save_session()
         self.error_jump = None
         editor.set_error_line(None)
         self.diags = []
@@ -304,7 +419,58 @@ class Pytobs(App[None]):
         if not initial:
             self.detect_interpreter()
             self.schedule_lint(0.1)
+            editor.focus()
         self.refresh_chrome()
+
+    def _save_session(self) -> None:
+        self.session.last_file = str(self.file_path) if self.file_path else None
+        self.session.open_files = [str(t.path) for t in self.tabs]
+        self.session.save()
+
+    def action_close_tab(self, index: int | None = None) -> None:
+        index = self.active if index is None else index
+        if not (0 <= index < len(self.tabs)):
+            return
+        if index == self.active:
+            self.save()
+            self.remember_cursor()
+        tab = self.tabs[index]
+        text = self.editor.text if index == self.active else tab.text
+        if tab.path.parent == scratch_dir().resolve() and not text.strip():
+            tab.path.unlink(missing_ok=True)  # an empty scratch file isn't worth keeping
+        if len(self.tabs) == 1:
+            self.tabs.clear()
+            self.active = -1
+            self.open_file(new_scratch_path())
+            return
+        del self.tabs[index]
+        if index == self.active:
+            self.active = -1  # nothing to stash: the closed tab is gone
+            self._activate(min(index, len(self.tabs) - 1), initial=False)
+        else:
+            if index < self.active:
+                self.active -= 1
+            self._save_session()
+            self._render_tabline()
+
+    def action_next_tab(self) -> None:
+        if len(self.tabs) > 1:
+            self._activate((self.active + 1) % len(self.tabs))
+
+    def action_prev_tab(self) -> None:
+        if len(self.tabs) > 1:
+            self._activate((self.active - 1) % len(self.tabs))
+
+    def action_goto_tab(self, index: int) -> None:
+        if index < len(self.tabs):
+            self._activate(index)
+
+    @on(TabBar.Clicked)
+    def _tab_clicked(self, event: TabBar.Clicked) -> None:
+        if event.close:
+            self.action_close_tab(event.index)
+        else:
+            self._activate(event.index)
 
     def remember_cursor(self) -> None:
         if self.file_path:
@@ -353,14 +519,56 @@ class Pytobs(App[None]):
         self._render_status()
 
     def _render_tabline(self) -> None:
-        t = Text(no_wrap=True, overflow="ellipsis")
-        if self.file_path:
-            t.append(self.file_path.name, style=C.text)
-            if self.dirty:
-                t.append(f"  {G.dot}", style=C.muted)
-            if self.file_path.parent == scratch_dir().resolve():
-                t.append("   scratch", style=C.faint)
-        self.query_one("#tabline", Static).update(t)
+        bar = self.query_one(TabBar)
+        width = max(20, bar.size.width or self.size.width // 2)
+        scratch = scratch_dir().resolve()
+        cells: list[tuple[Text, int, int]] = []  # (text, tab index, close offset or -1)
+        for i, tab in enumerate(self.tabs):
+            active = i == self.active
+            dirty = self.dirty if active else tab.text != tab.saved_text
+            bg = C.base if active else C.mantle
+            t = Text()
+            t.append("  ", style=Style(bgcolor=bg))
+            name = tab.path.name if len(tab.path.name) <= 28 else tab.path.name[:27] + "…"
+            t.append(name, style=Style(color=C.text if active else C.muted, bgcolor=bg, bold=active))
+            if tab.path.parent == scratch:
+                t.append(" scratch", style=Style(color=C.faint, bgcolor=bg))
+            close_at = -1
+            if dirty:
+                t.append(f" {G.dot}", style=Style(color=C.accent if active else C.muted, bgcolor=bg))
+            elif active and len(self.tabs) > 1:
+                close_at = t.cell_len + 1
+                t.append(f" {G.cross}", style=Style(color=C.faint, bgcolor=bg))
+            t.append("  ", style=Style(bgcolor=bg))
+            cells.append((t, i, close_at))
+        # keep the active tab visible: widen a window around it until the bar is full
+        lo = hi = max(0, self.active)
+        used = cells[lo][0].cell_len if cells else 0
+        while True:
+            grown = False
+            for cand in (hi + 1, lo - 1):
+                if 0 <= cand < len(cells) and (cand > hi or cand < lo):
+                    w = cells[cand][0].cell_len
+                    if used + w <= width - 6:
+                        used += w
+                        lo, hi = min(lo, cand), max(hi, cand)
+                        grown = True
+            if not grown:
+                break
+        line = Text(no_wrap=True, overflow="crop")
+        hits: list[tuple[int, int, int, bool]] = []
+        if lo > 0:
+            line.append(f" ‹{lo} ", style=C.faint)
+        for t, i, close_at in cells[lo : hi + 1]:
+            x0 = line.cell_len
+            line.append_text(t)
+            if close_at >= 0:
+                hits.append((x0 + close_at, x0 + close_at + 1, i, True))
+            hits.append((x0, line.cell_len, i, False))
+        if hi < len(cells) - 1:
+            line.append(f" {len(cells) - 1 - hi}› ", style=C.faint)
+        bar.hits = hits
+        bar.update(line)
 
     def _render_runhead(self) -> None:
         t = Text(no_wrap=True, overflow="ellipsis")
@@ -1105,6 +1313,13 @@ class Pytobs(App[None]):
         )
         yield SystemCommand("Stop", "Stop the running program  (Ctrl+C)", self.action_stop)
         yield SystemCommand("Open file", "Open a file in this folder  (Ctrl+P)", self.action_open)
+        yield SystemCommand("Close file", "Close the file in focus  (Ctrl+W)", self.action_close_tab)
+        yield SystemCommand(
+            "Next file", "Focus the next open file  (Ctrl+PgDn or Alt+→)", self.action_next_tab
+        )
+        yield SystemCommand(
+            "Previous file", "Focus the previous open file  (Ctrl+PgUp or Alt+←)", self.action_prev_tab
+        )
         yield SystemCommand(
             "New scratch file", "Start a fresh scratch file  (Ctrl+N)", self.action_new_scratch
         )
