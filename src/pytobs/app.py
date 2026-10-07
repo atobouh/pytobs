@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections.abc import Iterable
@@ -20,14 +21,16 @@ from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widgets import Input, Static, TextArea
 
-from . import lint, packages, tracebacks
+from . import explain, lint, packages, tracebacks
 from .completion.client import CompletionClient
 from .editor import CodeEditor
 from .env import Interpreter, find_interpreter, interpreter_version
 from .output import OutputLog
-from .paths import Config, Session, atomic_write, new_scratch_path, scratch_dir
+from .paths import Config, Session, atomic_write, data_dir, new_scratch_path, scratch_dir
 from .runner import Run
+from .stats import Stats, fmt_duration, level
 from .theme import APP_THEME, C, G
+from .trace_view import Trace, TraceView
 
 SKIP_DIRS = {
     ".git",
@@ -139,6 +142,9 @@ class Pytobs(App[None]):
     COMMAND_PALETTE_BINDING = "ctrl+k"
     BINDINGS = [
         Binding("ctrl+r,f5", "run", "Run", priority=True),
+        Binding("f6", "trace", "Watch it run", priority=True),
+        Binding("ctrl+t", "run_tests", "Run tests", priority=True),
+        Binding("ctrl+g", "progress", "Progress", priority=True),
         Binding("ctrl+c", "ctrl_c", "Stop / copy", priority=True, show=False),
         Binding("ctrl+e", "jump_error", "Jump to error", priority=True),
         Binding("ctrl+s", "save", "Save", priority=True),
@@ -174,7 +180,11 @@ class Pytobs(App[None]):
         self._doc_gen = 0
         self._debouncers: dict[str, Timer] = {}
         self._layout_forced: str | None = None
+        self.stats = Stats.load()
+        self.mode = "run"  # what the current process is: "run", "trace" or "tests"
+        self._result_path: Path | None = None
         self._stopped = False
+        self.last_error: tuple[str, str] | None = None  # (exception type, concept to review)
         self._activity: str | None = None  # label shown while a non-script command runs
         self._note: Text | None = None  # result line for the run header (e.g. after an install)
         self.register_theme(APP_THEME)
@@ -190,6 +200,7 @@ class Pytobs(App[None]):
             with Vertical(id="output-col"):
                 yield Static(id="runhead")
                 yield OutputLog(id="output")
+                yield TraceView(id="trace")
                 yield Input(id="stdin", placeholder="type input for the program, Enter to send")
         yield Static(id="status")
         with Horizontal(id="popup"):
@@ -216,6 +227,7 @@ class Pytobs(App[None]):
         self.editor.focus()
         self._apply_layout()
         self.call_after_refresh(self._after_first_paint)
+        self.set_interval(60, self.stats.save)
 
     def _show_welcome(self) -> None:
         out = self.output
@@ -224,9 +236,11 @@ class Pytobs(App[None]):
         out.add_line(Text(""))
         for key, label in (
             ("Ctrl+R", "run"),
+            ("F6", "watch it run, step by step"),
+            ("Ctrl+T", "run tests"),
             ("Ctrl+E", "jump to an error"),
             ("Ctrl+P", "open a file"),
-            ("Ctrl+N", "new scratch file"),
+            ("Ctrl+G", "your progress"),
             ("Ctrl+K", "all commands, install packages"),
         ):
             line = Text()
@@ -357,6 +371,15 @@ class Pytobs(App[None]):
             t.append(self._activity or "running", style=C.text)
             t.append(f"   {run.elapsed:5.1f}s", style=C.muted)
             t.append("     ^C stop", style=C.faint)
+        elif self.query_one(TraceView).has_class("show") and self.query_one(TraceView).trace:
+            view = self.query_one(TraceView)
+            total = len(view.trace.steps)
+            t.append(f"{G.run} ", style=C.accent)
+            t.append("watch it run", style=C.text)
+            t.append("   step ", style=C.muted)
+            t.append(str(view.index + 1), style=C.text)
+            t.append(f" of {total}", style=C.muted)
+            t.append("     ← → step   Esc done", style=C.faint)
         elif self._note is not None:
             t.append_text(self._note)
         elif self.last_run:
@@ -427,6 +450,9 @@ class Pytobs(App[None]):
 
     @on(TextArea.Changed, "#editor")
     def _on_edit(self) -> None:
+        self.stats.touch()
+        if self.query_one(TraceView).has_class("show"):
+            self.close_trace()
         self._render_tabline()
         if self.editor.error_line is not None:
             self.editor.set_error_line(None)
@@ -709,30 +735,58 @@ class Pytobs(App[None]):
     # ── running ──────────────────────────────────────────────────────────────
 
     def action_run(self) -> None:
+        self._launch("run")
+
+    def action_trace(self) -> None:
+        self._launch("trace")
+
+    def action_run_tests(self) -> None:
+        self._launch("tests")
+
+    def _launch(self, mode: str) -> None:
         self.hide_popups()
         if not self.save() or not self.file_path:
             return
-        self.run_worker(self._start_run(), exclusive=True, group="run")
+        self.run_worker(self._start_run(mode), exclusive=True, group="run")
 
-    async def _start_run(self) -> None:
+    async def _start_run(self, mode: str = "run") -> None:
         if self.current and not self.current.finished:
             await self.current.stop(grace=0.5)
         if not self.interp:
             self.interp = await asyncio.to_thread(find_interpreter, self.file_path, self.python_override)
         assert self.file_path
+        self.close_trace()
         self.output.clear()
         self.error_jump = None
+        self.last_error = None
         self.editor.set_error_line(None)
         self._stderr_buffer = None
-        self.run_count += 1
-        self.current = Run(self.interp.executable, self.file_path, self._on_run_output, self._on_run_exit)
+        self.mode = mode
+        argv = None
+        self._result_path = None
+        if mode in ("trace", "tests"):
+            helper = (
+                Path(__file__).parent
+                / "helpers"
+                / ("trace_runner.py" if mode == "trace" else "test_runner.py")
+            )
+            tmp = data_dir() / "tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            self._result_path = tmp / f"{mode}-{os.getpid()}.json"
+            self._result_path.unlink(missing_ok=True)
+            argv = [self.interp.executable, "-u", str(helper), str(self._result_path), str(self.file_path)]
+        if mode != "tests":
+            self.run_count += 1
+        self.current = Run(
+            self.interp.executable, self.file_path, self._on_run_output, self._on_run_exit, argv=argv
+        )
         stdin = self.query_one("#stdin", Input)
         stdin.value = ""
         stdin.add_class("show")
         stdin.focus()  # typing goes to the program while it runs; Esc returns to the editor
         self._stopped = False
         self._note = None
-        self._activity = None
+        self._activity = {"run": None, "trace": "recording steps", "tests": "running tests"}[mode]
         self._debouncers["tick"] = self.set_interval(1 / 8, self._render_runhead)
         await self.current.start()
         self._render_runhead()
@@ -751,7 +805,8 @@ class Pytobs(App[None]):
             self.output.write(text, "")
 
     def _on_run_exit(self, code: int, seconds: float) -> None:
-        self.last_run = (code, seconds)
+        if self.mode != "tests":
+            self.last_run = (code, seconds)
         timer = self._debouncers.pop("tick", None)
         if timer:
             timer.stop()
@@ -768,7 +823,151 @@ class Pytobs(App[None]):
             self._stderr_buffer = None
         elif code not in (0, -1):
             self.output.ensure_newline()
+        self._activity = None
+        if not self._stopped and self.file_path:
+            error_type, concept = self.last_error or (None, None)
+            self.stats.record_run(str(self.file_path), error_type, concept)
+        if self.mode == "tests" and not self._stopped:
+            self._show_tests()
+        elif self.mode == "trace" and not self._stopped:
+            self._open_trace()
         self._render_runhead()
+
+    # ── tests ────────────────────────────────────────────────────────────────
+
+    def _read_result(self) -> dict | None:
+        path = self._result_path
+        if not path or not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        finally:
+            path.unlink(missing_ok=True)
+
+    def _show_tests(self) -> None:
+        data = self._read_result()
+        if data is None:
+            return  # the file itself failed to load; the error is already shown and explained
+        out = self.output
+        tests = data.get("tests", [])
+        out.ensure_newline()
+        if out.has_content:
+            out.add_line(Text(""))
+        if not tests:
+            note = Text()
+            note.append(f"{G.dot} ", style=C.muted)
+            note.append("no tests", style=C.text)
+            self._note = note
+            out.add_line(Text("No tests in this file yet.", style=C.text))
+            out.add_line(Text(""))
+            out.add_line(
+                Text("A test is a function whose name starts with test_ and that uses assert:", style=C.muted)
+            )
+            out.add_line(Text(""))
+            for code in ("def test_double():", "    assert double(2) == 4"):
+                out.add_line(Text("  " + code, style=C.text))
+            out.add_line(Text(""))
+            out.add_line(
+                Text(
+                    'Put code that should only run normally under  if __name__ == "__main__":', style=C.faint
+                )
+            )
+            return
+        passed = sum(t["status"] == "pass" for t in tests)
+        failed = len(tests) - passed
+        note = Text()
+        note.append(f"{G.dot if not failed else G.cross} ", style=C.ok if not failed else C.error)
+        note.append("tests", style=C.text)
+        note.append(f"   {passed} passed", style=C.muted)
+        if failed:
+            note.append(f" · {failed} failed", style=C.error)
+        note.append(f"   {data.get('seconds', 0):.2f}s", style=C.muted)
+        self._note = note
+        bar_w = max(10, out.scrollable_content_region.width - 3)
+        filled = round(bar_w * passed / len(tests))
+        bar = Text()
+        bar.append("━" * filled, style=C.ok)
+        bar.append("━" * (bar_w - filled), style=C.error if failed else C.surface)
+        out.add_line(bar)
+        out.add_line(Text(""))
+        first_fail = None
+        for t in tests:
+            row = Text()
+            ok = t["status"] == "pass"
+            row.append(f"{G.dot} " if ok else f"{G.cross} ", style=C.ok if ok else C.error)
+            row.append(t["name"], style=C.text if ok else Style(color=C.text, bold=True))
+            out.add_line(row, jump=t.get("line"))
+            if ok:
+                continue
+            first_fail = first_fail or t.get("line")
+            if "expected" in t and t.get("op") == "Eq":
+                for label, key, color in (("expected", "expected", C.ok), ("got", "got", C.error)):
+                    line = Text(f"    {label:<9} ", style=C.muted)
+                    line.append(t[key], style=color)
+                    out.add_line(line)
+            elif "expected" in t:
+                line = Text("    ", style=C.muted)
+                line.append(t["got"], style=C.error)
+                line.append(f"  {t['op']}  ", style=C.faint)
+                line.append(t["expected"], style=C.text)
+                line.append("  was False", style=C.muted)
+                out.add_line(line)
+            elif t.get("message"):
+                out.add_line(
+                    Text("    " + t["message"], style=C.error if t["status"] == "error" else C.muted)
+                )
+            loc = Text("    ")
+            loc.append(
+                f"{self.file_path.name if self.file_path else ''}:{t.get('line')}",
+                style=Style(color=C.accent, underline=True),
+            )
+            out.add_line(loc, jump=t.get("line"))
+        if first_fail:
+            self.error_jump = first_fail
+            self.editor.set_error_line(first_fail - 1)
+
+    # ── watch it run ─────────────────────────────────────────────────────────
+
+    def _open_trace(self) -> None:
+        data = self._read_result()
+        if not data or not data.get("steps"):
+            return
+        trace = Trace.from_json(data, self.editor.text)
+        view = self.query_one(TraceView)
+        self.output.display = False
+        view.add_class("show")
+        view.load(trace, self.editor.text)
+        view.focus()
+
+    def close_trace(self) -> None:
+        view = self.query_one(TraceView)
+        if not view.has_class("show"):
+            return
+        view.remove_class("show")
+        self.output.display = True
+        self.editor.set_trace_line(None)
+        if view.has_focus:
+            self.editor.focus()
+        self._render_runhead()
+
+    @on(TraceView.Moved)
+    def _trace_moved(self, event: TraceView.Moved) -> None:
+        view = self.query_one(TraceView)
+        if not view.trace:
+            return
+        row = view.trace.steps[event.index]["l"] - 1
+        editor = self.editor
+        editor.set_trace_line(row)
+        row = max(0, min(row, editor.document.line_count - 1))
+        text = editor.document[row]
+        editor.move_cursor((row, len(text) - len(text.lstrip())), center=True)
+        self._render_runhead()
+
+    @on(TraceView.Closed)
+    def _trace_closed(self) -> None:
+        self.close_trace()
 
     def _show_error(self, raw: str) -> None:
         out = self.output
@@ -807,6 +1006,10 @@ class Pytobs(App[None]):
         if hidden:
             out.add_line(Text(f"+ {hidden} library frame{'s' if hidden != 1 else ''} hidden", style=C.faint))
         self.error_jump = tracebacks.jump_target(err, self.file_path)
+        note = explain.explain(err, self.file_path, self.editor.text)
+        self.last_error = (err.exception.partition(":")[0].rsplit(".", 1)[-1], note.review if note else "")
+        if note:
+            self._render_explanation(note)
         if self.error_jump:
             out.add_line(Text(""))
             hint = Text()
@@ -814,6 +1017,27 @@ class Pytobs(App[None]):
             hint.append(f"  jump to line {self.error_jump}", style=C.muted)
             out.add_line(hint, jump=self.error_jump)
             self.editor.set_error_line(self.error_jump - 1)
+
+    def _render_explanation(self, note: explain.Explanation) -> None:
+        out = self.output
+        out.add_line(Text(""))
+        out.add_line(Text("─" * 40, style=C.surface))
+        out.add_line(Text("What it means", style=C.accent))
+        out.add_line(Text(note.meaning, style=C.muted))
+        if note.tries:
+            out.add_line(Text(""))
+            out.add_line(Text("Try", style=C.accent))
+            width = max(len(code) for code, _ in note.tries)
+            pane = max(20, out.scrollable_content_region.width - 2)
+            side_by_side = all(width + 5 + len(hint) <= pane for _, hint in note.tries)
+            for code, hint in note.tries:
+                line = Text("  ")
+                line.append(code, style=C.text)
+                if hint and side_by_side:
+                    line.append(" " * (width - len(code) + 3) + hint, style=C.faint)
+                out.add_line(line)
+                if hint and not side_by_side:
+                    out.add_line(Text("    " + hint, style=C.faint))
 
     @on(Input.Submitted, "#stdin")
     def _send_input(self, event: Input.Submitted) -> None:
@@ -872,6 +1096,13 @@ class Pytobs(App[None]):
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         yield SystemCommand("Run", "Save and run this file  (Ctrl+R)", self.action_run)
+        yield SystemCommand("Watch it run", "Step through your code line by line  (F6)", self.action_trace)
+        yield SystemCommand(
+            "Run tests", "Run every test_ function in this file  (Ctrl+T)", self.action_run_tests
+        )
+        yield SystemCommand(
+            "Your progress", "Streak, runs, time and common errors  (Ctrl+G)", self.action_progress
+        )
         yield SystemCommand("Stop", "Stop the running program  (Ctrl+C)", self.action_stop)
         yield SystemCommand("Open file", "Open a file in this folder  (Ctrl+P)", self.action_open)
         yield SystemCommand(
@@ -1022,7 +1253,16 @@ class Pytobs(App[None]):
         self._note = None
         self._render_runhead()
 
+    async def on_unmount(self) -> None:
+        self.stats.save()
+        await self.completion.close()
+
+    def action_progress(self) -> None:
+        self.stats.save()
+        self.push_screen(ProgressScreen(self.stats))
+
     async def action_quit(self) -> None:
+        self.stats.save()
         self.save()
         self.remember_cursor()
         if self.current and not self.current.finished:
@@ -1037,6 +1277,76 @@ class Pytobs(App[None]):
         if timer:
             timer.stop()
         self._debouncers[name] = self.set_timer(delay, callback)
+
+
+HEAT_SHADES = ["#363646", "#3A4A6B", "#4E6699", "#6683BF", C.accent]
+
+
+class ProgressScreen(ModalScreen[None]):
+    """Streak, runs, coding time, an activity grid and the errors met most."""
+
+    DEFAULT_CSS = f"""
+    ProgressScreen {{ background: {C.base} 55%; align: center top; }}
+    ProgressScreen > Static {{
+        width: auto; max-width: 96%; height: auto; max-height: 96%; margin-top: 2;
+        background: {C.surface}; padding: 1 3;
+    }}
+    """
+    BINDINGS = [Binding("escape,q,ctrl+g", "dismiss", "Close", show=False)]
+
+    def __init__(self, stats: Stats) -> None:
+        super().__init__()
+        self.stats = stats
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._content())
+
+    def _content(self) -> Text:
+        s = self.stats.summary()
+        out = Text()
+        out.append("Your progress", style=Style(color=C.text, bold=True))
+        out.append(f"    last {s.weeks} weeks\n\n", style=C.muted)
+        numbers = [
+            (str(s.streak), "day streak" if s.streak != 1 else "day streak"),
+            (str(s.runs_week), "runs this week"),
+            (fmt_duration(s.seconds_week), "coding this week"),
+            (str(s.fixed_total), "errors fixed"),
+        ]
+        for value, _ in numbers:
+            out.append(f"{value:<18}", style=Style(color=C.text, bold=True))
+        out.append("\n")
+        for _, label in numbers:
+            out.append(f"{label:<18}", style=C.muted)
+        out.append("\n\n")
+        days = ["Mon", "   ", "Wed", "   ", "Fri", "   ", "Sun"]
+        for d in range(7):
+            out.append(f"{days[d]}  ", style=C.faint)
+            for runs in s.heat[d]:
+                out.append("■ ", style=Style(color=HEAT_SHADES[level(runs)]))
+            out.append("\n")
+        out.append("     less ", style=C.faint)
+        for shade in HEAT_SHADES:
+            out.append("■ ", style=Style(color=shade))
+        out.append("more", style=C.faint)
+        out.append("\n\n")
+        out.append("Errors you meet most", style=Style(color=C.text, bold=True))
+        if not s.top_errors:
+            out.append("\n\n")
+            out.append("None yet. Errors you hit will show here with the concept to review.", style=C.muted)
+        else:
+            out.append("    and what to review\n", style=C.muted)
+            most = s.top_errors[0][1]
+            for i, (name, count, concept) in enumerate(s.top_errors):
+                bar = max(1, round(20 * count / most))
+                out.append(f"\n{name[:18]:<20}", style=C.text)
+                out.append("━" * bar, style=C.error if i == 0 else C.muted)
+                out.append(" " * (21 - bar))
+                out.append(f"{count:<5}", style=C.text)
+                out.append(concept, style=C.faint)
+        out.append("\n\n")
+        out.append("Esc close   ", style=C.faint)
+        out.append("Counted on this computer only.", style=C.faint)
+        return out
 
 
 class PackagePrompt(ModalScreen[str | None]):

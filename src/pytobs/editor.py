@@ -63,6 +63,7 @@ class CodeEditor(TextArea):
         self.indent_width = INDENT
         self.diagnostics: dict[int, Diagnostic] = {}
         self.error_line: int | None = None  # 0-based line of the last run's error
+        self.trace_line: int | None = None  # 0-based line shown by "Watch it run"
         self.popup_open = False
 
     # ── rendering ────────────────────────────────────────────────────────────
@@ -78,7 +79,11 @@ class CodeEditor(TextArea):
             return strip
         row = y + int(self.scroll_offset.y)
         marker = None
-        if row == self.error_line:
+        glyph = G.dot
+        if row == self.trace_line:
+            marker = Style(color=C.accent, bgcolor=C.base)
+            glyph = G.run
+        elif row == self.error_line:
             marker = Style(color=C.error, bgcolor=C.base)
         elif row in self.diagnostics:
             diag = self.diagnostics[row]
@@ -86,7 +91,7 @@ class CodeEditor(TextArea):
         if marker is None:
             return strip
         rest = strip.crop(1, strip.cell_length)
-        return Strip.join([Strip([Segment(G.dot, marker)], 1), rest])
+        return Strip.join([Strip([Segment(glyph, marker)], 1), rest])
 
     def _build_highlight_map(self) -> None:
         """Query tree-sitter only for the visible window plus one screen either side."""
@@ -128,6 +133,11 @@ class CodeEditor(TextArea):
         self.diagnostics = {}
         for d in diags:
             self.diagnostics.setdefault(d.row, d)
+        self._line_cache.clear()
+        self.refresh()
+
+    def set_trace_line(self, row: int | None) -> None:
+        self.trace_line = row
         self._line_cache.clear()
         self.refresh()
 

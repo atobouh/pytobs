@@ -48,6 +48,9 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | Key | Does |
 |---|---|
 | **Ctrl+R** or **F5** | Save and run |
+| **F6** | Watch it run: step through your code line by line (← → to step, Esc to finish) |
+| **Ctrl+T** | Run every `test_` function in this file |
+| **Ctrl+G** | Your progress: streak, runs, coding time, errors you meet most |
 | **Ctrl+C** | Stop the program (copies instead when text is selected) |
 | **Ctrl+E** | Jump to the line that raised the error |
 | **Ctrl+P** | Open a file in this folder |
@@ -70,6 +73,23 @@ Files save automatically one second after you stop typing.
 - **Readable errors.** The exception first, then your line with Python's own markers. Library frames are hidden. Click the location or press Ctrl+E to jump there.
 - **Suggestions as you type** (Jedi, in a separate process so typing never waits), with signature and docs beside the list.
 - **ruff** checks while you pause. A dot in the margin marks the line; the message shows in the status bar when your cursor is on it.
+
+## Learning tools
+
+All four are plain, deterministic Python: no AI, no internet, the same input always gives the same result.
+
+- **Explain this error.** Under every traceback, a short note on what the error means and, when it can be
+  stated with certainty, a corrected line built from your code. About 45 rules cover the errors learners
+  meet most (wrong argument counts, str + int, None from .sort(), index out of range, missing keys, typos,
+  indentation, a file named random.py, …). Any other built-in error gets a one-line meaning.
+- **Watch it run (F6).** Records every line your file executes and the variables at that moment, then lets
+  you step through it. Changed values are highlighted, lists are drawn as boxes with the loop's position
+  marked, dicts as key → value. Library internals are not recorded; recording stops after 5,000 steps
+  while the program keeps running.
+- **Tests (Ctrl+T).** Any function named `test_…` in the file is a test. You get a dot per test and, for
+  `assert a == b`, the expected and actual values. Code under `if __name__ == "__main__":` doesn't run.
+- **Your progress (Ctrl+G).** A 16-week activity grid, streak, runs and coding time this week, errors
+  fixed, and your most frequent errors with the concept to review. Stored only on your computer.
 
 ## Packages
 

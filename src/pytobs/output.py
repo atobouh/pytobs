@@ -117,8 +117,9 @@ class OutputLog(ScrollView, can_focus=True):
             if line.cell_len <= width:
                 out.append((index, line))
             else:
-                offsets = list(range(width, len(line.plain), width))
-                out.extend((index, part) for part in line.divide(offsets))
+                # wrap at word boundaries; words longer than the pane fold
+                parts = line.wrap(self.app.console, width, overflow="fold", no_wrap=False)
+                out.extend((index, part) for part in parts)
         return out
 
     def _rewrap_all(self) -> None:

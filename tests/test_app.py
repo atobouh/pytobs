@@ -78,3 +78,54 @@ async def test_autosave_on_run(tmp_path: Path) -> None:
                 break
         assert script.read_text() == 'print("hi")'
         assert [t.plain for t in app.output.lines][0] == "hi"
+
+
+async def _wait(app, pilot) -> None:
+    for _ in range(200):
+        await pilot.pause(0.05)
+        if app.current and app.current.finished and app._activity is None:
+            break
+    await pilot.pause(0.2)
+
+
+async def test_watch_it_run(tmp_path: Path) -> None:
+    script = tmp_path / "loop.py"
+    script.write_text("total = 0\nfor n in [1, 2, 3]:\n    total += n\nprint(total)\n")
+    app = Pytobs(path=script, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.press("f6")
+        await _wait(app, pilot)
+        view = app.query_one("TraceView")
+        assert view.has_class("show") and view.trace and len(view.trace.steps) == 9
+        assert app.editor.trace_line == 0
+        await pilot.press("right", "right")
+        assert app.editor.trace_line == 2 and view.index == 2
+        await pilot.press("end")
+        assert view.index == 8
+        await pilot.press("escape")
+        assert not view.has_class("show") and app.output.display
+        assert app.editor.trace_line is None
+
+
+async def test_tests_panel(tmp_path: Path) -> None:
+    script = tmp_path / "t.py"
+    script.write_text("def test_a():\n    assert 1 == 1\n\ndef test_b():\n    assert [1] == [2]\n")
+    app = Pytobs(path=script, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.press("ctrl+t")
+        await _wait(app, pilot)
+        lines = [t.plain for t in app.output.lines]
+        assert "● test_a" in lines and "× test_b" in lines
+        assert any("expected  [2]" in line for line in lines)
+        assert app.error_jump == 5
+        assert "1 passed" in app._note.plain
+
+
+async def test_progress_screen_opens(tmp_path: Path) -> None:
+    app = Pytobs(path=tmp_path / "p.py", python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.press("ctrl+g")
+        await pilot.pause(0.2)
+        assert type(app.screen).__name__ == "ProgressScreen"
+        await pilot.press("escape")
+        assert type(app.screen).__name__ != "ProgressScreen"

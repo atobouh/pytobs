@@ -60,8 +60,11 @@ def looks_like_error_start(line: str) -> bool:
     return line.startswith(HEADER) or bool(FRAME_RE.match(line))
 
 
+REPEATED_RE = re.compile(r"^\s*\[Previous line repeated \d+ more times?\]$")
+
+
 def parse(text: str) -> ParsedError | None:
-    lines = text.rstrip("\n").split("\n")
+    lines = [line for line in text.rstrip("\n").split("\n") if not REPEATED_RE.match(line)]
     # Only the last exception in a chain matters for fixing the code.
     start = None
     for i, line in enumerate(lines):
