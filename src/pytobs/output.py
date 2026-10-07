@@ -8,6 +8,7 @@ from textual import events
 from textual.geometry import Size
 from textual.message import Message
 from textual.scroll_view import ScrollView
+from textual.selection import Selection
 from textual.strip import Strip
 
 from .theme import C
@@ -159,13 +160,44 @@ class OutputLog(ScrollView, can_focus=True):
         width = self.scrollable_content_region.width
         base = Style(bgcolor=C.mantle, color=C.text)
         if index >= len(self._wrapped):
-            return Strip.blank(width, base)
+            return Strip.blank(width, base).apply_offsets(0, index)
         logical, text = self._wrapped[index]
+        selection = self.text_selection
+        if selection is not None and (span := selection.get_span(index)) is not None:
+            start, end = span
+            text = text.copy()
+            text.stylize(Style(bgcolor=C.overlay, color=C.text), start, len(text) if end == -1 else end)
         segments = list(text.render(self.app.console))
         strip = Strip(segments, text.cell_len).apply_style(base)
         if logical in self.jumps:
             strip = strip.apply_style(Style(meta={"jump": self.jumps[logical]}))
-        return strip.extend_cell_length(width, base).crop(0, width)
+        # offsets let Textual map mouse drags to (line, column) for text selection
+        return strip.extend_cell_length(width, base).crop(0, width).apply_offsets(0, index)
+
+    # ── selection and copying ────────────────────────────────────────────────
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Text under a mouse selection. Wrapped pieces of one output line are joined back together."""
+        parts: list[str] = []
+        previous = None
+        for index, (logical, text) in enumerate(self._wrapped):
+            span = selection.get_span(index)
+            if span is None:
+                continue
+            start, end = span
+            piece = text.plain[start:] if end == -1 else text.plain[start:end]
+            if previous is not None and logical != previous:
+                parts.append("\n")
+            parts.append(piece)
+            previous = logical
+        return "".join(parts), "\n"
+
+    def selection_updated(self, selection: Selection | None) -> None:
+        self.refresh()
+
+    @property
+    def plain_text(self) -> str:
+        return "\n".join(line.plain for line in self.lines).rstrip("\n")
 
     def on_click(self, event: events.Click) -> None:
         index = event.y + int(self.scroll_offset.y)

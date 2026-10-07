@@ -51,7 +51,7 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | **F6** | Watch it run: step through your code line by line (← → to step, Esc to finish) |
 | **Ctrl+T** | Run every `test_` function in this file |
 | **Ctrl+G** | Your progress: streak, runs, coding time, errors you meet most |
-| **Ctrl+C** | Stop the program (copies instead when text is selected) |
+| **Ctrl+C** | Copy selected text (drag over the output to select) · otherwise stop the running program |
 | **Ctrl+E** | Jump to the line that raised the error |
 | **Ctrl+P** | Open a file in this folder (opens in a new tab; open files are listed first) |
 | **Alt+← / Alt+→** or **Ctrl+PgUp / Ctrl+PgDn** | Previous / next open file |
@@ -63,7 +63,7 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | **Ctrl+/** | Comment or uncomment lines |
 | **Ctrl+D** | Duplicate line (in the input box: end of input) |
 | **Ctrl+B** | Output beside or below the editor |
-| **Ctrl+L** | Clear output |
+| **Ctrl+L** | Clear output · **Ctrl+K → Copy all output** copies everything |
 | **Tab / Enter** | Accept a suggestion · **Esc** closes it |
 | **Ctrl+Q** | Save and quit |
 

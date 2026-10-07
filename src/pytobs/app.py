@@ -1299,6 +1299,11 @@ class Pytobs(App[None]):
         if isinstance(focused, CodeEditor) and not focused.selection.is_empty:
             focused.action_copy()
             return
+        selected = self.screen.get_selected_text()
+        if selected:
+            self._copy(selected)
+            self.screen.clear_selection()
+            return
         if running:
             self.action_stop()
         elif isinstance(focused, Input) and focused.selected_text:
@@ -1306,6 +1311,16 @@ class Pytobs(App[None]):
 
     def action_clear_output(self) -> None:
         self.output.clear()
+
+    def action_copy_output(self) -> None:
+        text = self.output.plain_text
+        if text.strip():
+            self._copy(text)
+
+    def _copy(self, text: str) -> None:
+        self.copy_to_clipboard(text)
+        lines = text.count("\n") + 1
+        self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=1.5)
 
     def on_key(self, event) -> None:
         if event.key == "ctrl+d" and isinstance(self.focused, Input) and self.focused.id == "stdin":
@@ -1354,6 +1369,7 @@ class Pytobs(App[None]):
         )
         yield SystemCommand("Format file", "Format with ruff  (Alt+F)", self.action_format)
         yield SystemCommand("Jump to error", "Cursor to the failing line  (Ctrl+E)", self.action_jump_error)
+        yield SystemCommand("Copy all output", "Copy everything in the output pane", self.action_copy_output)
         yield SystemCommand("Clear output", "Empty the output pane  (Ctrl+L)", self.action_clear_output)
         yield SystemCommand(
             "Toggle layout", "Output beside or below the editor  (Ctrl+B)", self.action_toggle_layout
