@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterable
 import dataclasses
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 from rich.style import Style
@@ -19,6 +19,7 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.command import CommandPalette, DiscoveryHit, Hit, Hits, Provider, SearchIcon
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.message import Message
@@ -118,6 +119,19 @@ class FileProvider(Provider):
 
 
 MAX_RESTORED_TABS = 12
+
+
+def ignore_after_exit(fn):
+    """For background jobs: if the window is already closing, the widgets are gone; drop the result."""
+
+    @wraps(fn)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await fn(self, *args, **kwargs)
+        except NoMatches:
+            return None
+
+    return wrapper
 
 
 @dataclass
@@ -718,6 +732,7 @@ class Pytobs(App[None]):
     # ── completion ───────────────────────────────────────────────────────────
 
     @work(group="interp", exclusive=True)
+    @ignore_after_exit
     async def detect_interpreter(self) -> None:
         interp = await asyncio.to_thread(find_interpreter, self.file_path, self.python_override)
         changed = interp != self.interp
@@ -744,6 +759,7 @@ class Pytobs(App[None]):
         self._fetch_completion(gen, editor.text, row + 1, col, start)
 
     @work(group="complete")
+    @ignore_after_exit
     async def _fetch_completion(
         self, gen: int, source: str, line: int, col: int, start: tuple[int, int]
     ) -> None:
@@ -821,6 +837,7 @@ class Pytobs(App[None]):
         self._fetch_doc(self._doc_gen, self._comp_view[self._comp_sel]["name"])
 
     @work(group="doc")
+    @ignore_after_exit
     async def _fetch_doc(self, gen: int, name: str) -> None:
         info = await self.completion.request("doc", name=name, timeout=5)
         doc = self.query_one("#doc", Static)
@@ -879,6 +896,7 @@ class Pytobs(App[None]):
         self._fetch_signature(editor.text, row + 1, col, row)
 
     @work(group="sig", exclusive=True)
+    @ignore_after_exit
     async def _fetch_signature(self, source: str, line: int, col: int, row: int) -> None:
         sig = await self.completion.request(
             "signature", source=source, line=line, col=col, path=str(self.file_path), timeout=5
@@ -915,6 +933,7 @@ class Pytobs(App[None]):
             self._run_lint(self.editor.text, self.file_path)
 
     @work(group="lint", exclusive=True)
+    @ignore_after_exit
     async def _run_lint(self, source: str, path: Path) -> None:
         diags = await lint.check(source, path)
         if source != self.editor.text:

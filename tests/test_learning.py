@@ -128,6 +128,7 @@ def test_stats_streak_week_and_fixed(tmp_path: Path, monkeypatch: pytest.MonkeyP
     stats.save()
     assert Stats.load().errors == {"TypeError": 1}
     assert [level(n) for n in (0, 1, 3, 7, 50)] == [0, 1, 2, 3, 4]
+    stats._last_touch = 0.0  # independent of how long the machine has been up
     stats.touch(100.0)
     stats.touch(130.0)
     stats.touch(1000.0)  # idle gap is not counted
