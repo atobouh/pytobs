@@ -138,6 +138,44 @@ def handle(msg: dict[str, Any]) -> Any:
             if index >= star:
                 index += 1
         return {"name": sig.name, "params": params, "index": index}
+    if op == "goto":
+        script = _script(msg)
+        defs = script.goto(msg["line"], msg["col"], follow_imports=True) or script.infer(
+            msg["line"], msg["col"]
+        )
+        if not defs:
+            return None
+        d = defs[0]
+        return {
+            "name": d.name,
+            "path": str(d.module_path) if d.module_path else None,
+            "line": d.line,
+            "col": d.column,
+            "builtin": d.in_builtin_module(),
+        }
+    if op == "help":
+        script = _script(msg)
+        defs = script.goto(msg["line"], msg["col"]) or script.help(msg["line"], msg["col"])
+        if not defs:
+            return None
+        d = defs[0]
+        try:
+            sigs = [_compact(s) for s in d.get_signatures()[:2]]
+        except Exception:
+            sigs = []
+        try:
+            doc = d.docstring(raw=True)
+        except Exception:
+            doc = ""
+        return {
+            "name": d.name,
+            "type": d.type,
+            "signatures": sigs,
+            "doc": _first_paragraphs(doc, 8) if doc else "",
+            "line": d.line,
+            "path": str(d.module_path) if d.module_path else None,
+            "builtin": d.in_builtin_module(),
+        }
     if op == "warm":
         script = _script({"source": msg.get("source", "import os, json, pathlib\n"), "path": msg.get("path")})
         script.complete(1, 0)

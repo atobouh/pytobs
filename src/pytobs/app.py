@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import keyword
 import os
 import time
 from collections.abc import Iterable
@@ -26,13 +27,15 @@ from textual.message import Message
 from textual.widgets import Input, Static, TextArea
 from textual.widgets.text_area import Selection
 
-from . import explain, lint, packages, tracebacks
+from . import explain, learn, lint, packages, tracebacks
 from .completion.client import CompletionClient
 from .editor import CodeEditor
+from .editor_text import find_all, outline, rename_symbol, word_at
 from .env import Interpreter, find_interpreter, interpreter_version
 from .output import OutputLog
 from .paths import Config, Session, atomic_write, data_dir, new_scratch_path, scratch_dir
 from .runner import Run
+from .screens import ConfirmPrompt, FileTree, FindBar, HelpCard, OutlineScreen, TextPrompt
 from .stats import Stats, fmt_duration, level
 from .theme import APP_THEME, C, G
 from .trace_view import Trace, TraceView
@@ -183,6 +186,7 @@ OutputLog {{ height: 1fr; }}
 Screen.stacked #main {{ layout: vertical; }}
 Screen.stacked #editor-col {{ width: 1fr; height: 3fr; }}
 Screen.stacked #output-col {{ width: 1fr; height: 2fr; padding: 1 0 0 2; }}
+Screen.stacked FileTree {{ width: 1fr; height: 8; }}
 #popup {{ layer: popup; position: absolute; width: auto; height: auto; display: none; }}
 #popup.show {{ display: block; }}
 #menu {{ width: auto; height: auto; background: {C.surface}; }}
@@ -205,8 +209,15 @@ class Pytobs(App[None]):
         Binding("ctrl+c", "ctrl_c", "Stop / copy", priority=True, show=False),
         Binding("ctrl+e", "jump_error", "Jump to error", priority=True),
         Binding("ctrl+s", "save", "Save", priority=True),
-        Binding("ctrl+o,ctrl+p", "open", "Open file", priority=True),
-        Binding("ctrl+n", "new_scratch", "New scratch", priority=True),
+        Binding("ctrl+p", "open", "Open file", priority=True),
+        Binding("ctrl+n", "new_file", "New file", priority=True),
+        Binding("ctrl+o", "outline", "Outline", priority=True),
+        Binding("ctrl+f", "find", "Find", priority=True),
+        Binding("alt+e", "toggle_files", "Files", priority=True),
+        Binding("f1", "help_word", "Explain word", priority=True),
+        Binding("f2", "rename_symbol", "Rename", priority=True),
+        Binding("f12", "goto_definition", "Go to definition", priority=True),
+        Binding("shift+f12", "go_back", "Go back", priority=True),
         Binding("ctrl+w", "close_tab", "Close file", priority=True),
         Binding("ctrl+pagedown,alt+right", "next_tab", "Next file", priority=True),
         Binding("ctrl+pageup,alt+left", "prev_tab", "Previous file", priority=True),
@@ -253,6 +264,7 @@ class Pytobs(App[None]):
         self.last_error: tuple[str, str] | None = None  # (exception type, concept to review)
         self._activity: str | None = None  # label shown while a non-script command runs
         self._note: Text | None = None  # result line for the run header (e.g. after an install)
+        self._back: list[tuple[Path, tuple[int, int]]] = []  # where F12 jumped from
         self.register_theme(APP_THEME)
         self.theme = "sumi"
 
@@ -263,6 +275,7 @@ class Pytobs(App[None]):
             with Vertical(id="editor-col"):
                 yield TabBar(id="tabline")
                 yield CodeEditor(id="editor")
+                yield FindBar(id="findbar")
             with Vertical(id="output-col"):
                 yield Static(id="runhead")
                 yield OutputLog(id="output")
@@ -313,8 +326,14 @@ class Pytobs(App[None]):
             ("F6", "watch it run, step by step"),
             ("Ctrl+T", "run tests"),
             ("Ctrl+E", "jump to an error"),
+            ("Ctrl+N", "new file"),
+            ("Alt+E", "files sidebar"),
             ("Ctrl+P", "open a file in a new tab"),
             ("Alt+← →", "switch between open files"),
+            ("Ctrl+O", "outline, go to line"),
+            ("Ctrl+F", "find and replace"),
+            ("F1", "explain a word"),
+            ("Tab", "after for / if / def: fills the block"),
             ("Ctrl+G", "your progress"),
             ("Ctrl+K", "all commands, install packages"),
         ):
@@ -509,6 +528,9 @@ class Pytobs(App[None]):
         return True
 
     def action_save(self) -> None:
+        if self._is_scratch(self.file_path):
+            self.action_save_as()
+            return
         if self.cfg.format_on_save:
             self.run_worker(self._format_then_save(), exclusive=True, group="format")
         else:
@@ -520,6 +542,508 @@ class Pytobs(App[None]):
 
     def action_new_scratch(self) -> None:
         self.open_file(new_scratch_path())
+
+    # ── naming, saving and moving files ──────────────────────────────────────
+
+    @staticmethod
+    def _is_scratch(path: Path | None) -> bool:
+        return path is not None and path.parent == scratch_dir().resolve()
+
+    def project_dir(self) -> Path:
+        """Where new files go: the folder of the file in focus, or of the last real file."""
+        if self.file_path and not self._is_scratch(self.file_path):
+            return self.file_path.parent
+        for tab in reversed(self.tabs):
+            if not self._is_scratch(tab.path):
+                return tab.path.parent
+        return Path.cwd()
+
+    def _resolve_name(self, name: str, folder: Path) -> Path | None:
+        name = name.strip().strip('"').strip("'")
+        if not name:
+            return None
+        path = Path(name).expanduser()
+        if not path.is_absolute():
+            path = folder / path
+        if not path.suffix and not name.endswith(("/", "\\")):
+            path = path.with_suffix(".py")
+        return path.resolve()
+
+    def _ask(self, prompt: TextPrompt, then) -> None:
+        if not isinstance(self.screen, ModalScreen):
+            self.push_screen(prompt, then)
+
+    def action_new_file(self, folder: Path | None = None) -> None:
+        folder = folder or self.project_dir()
+        self._ask(
+            TextPrompt(
+                "New file",
+                f"In {short_path(folder)}   ·   a folder works too: week2/loops.py\nLeave empty for a scratch file.",
+                placeholder="loops.py",
+                ok="create",
+            ),
+            partial(self._create_file, folder),
+        )
+
+    def _create_file(self, folder: Path, name: str | None) -> None:
+        if name is None:
+            return
+        if not name:
+            self.action_new_scratch()
+            return
+        path = self._resolve_name(name, folder)
+        if path is None:
+            return
+        if path.is_dir():
+            self.notify(f"{path.name} is a folder", severity="warning")
+            return
+        existed = path.exists()
+        self.open_file(path)
+        self._refresh_files()
+        if existed:
+            self.notify(f"{path.name} already existed: opened it", timeout=2)
+
+    def action_save_as(self) -> None:
+        if not self.file_path:
+            return
+        folder = self.project_dir()
+        current = "" if self._is_scratch(self.file_path) else self.file_path.name
+        self._ask(
+            TextPrompt(
+                "Save as", f"In {short_path(folder)}", value=current, placeholder="my_program.py", ok="save"
+            ),
+            partial(self._save_as, folder),
+        )
+
+    def _save_as(self, folder: Path, name: str | None) -> None:
+        path = self._resolve_name(name or "", folder)
+        old = self.file_path
+        if path is None or old is None or path == old:
+            return
+        if path.exists() and self._tab_index(path) >= 0:
+            self.notify(f"{path.name} is already open", severity="warning")
+            return
+        text = self.editor.text
+        try:
+            atomic_write(path, text)
+        except OSError as exc:
+            self.notify(f"Couldn't save: {exc}", severity="error")
+            return
+        self._retarget(old, path)
+        self.saved_text = text
+        if self._is_scratch(old):
+            old.unlink(missing_ok=True)
+        self._after_path_change()
+        self.notify(f"Saved as {path.name}", timeout=2)
+
+    def action_rename_file(self, target: Path | None = None) -> None:
+        target = target or self.file_path
+        if target is None:
+            return
+        self._ask(
+            TextPrompt("Rename", f"In {short_path(target.parent)}", value=target.name, ok="rename"),
+            partial(self._rename_path, target),
+        )
+
+    def _rename_path(self, old: Path, name: str | None) -> None:
+        if not name:
+            return
+        new = Path(name).expanduser()
+        new = (new if new.is_absolute() else old.parent / new).resolve()
+        if old.is_file() and not new.suffix:
+            new = new.with_suffix(old.suffix or ".py")
+        if new == old:
+            return
+        if new.exists():
+            self.notify(f"{new.name} already exists", severity="warning")
+            return
+        if any(self._same_or_inside(t.path, old) for t in self.tabs):
+            self.save()
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, new)
+        except OSError as exc:
+            self.notify(f"Couldn't rename: {exc}", severity="error")
+            return
+        self._retarget(old, new)
+        self._after_path_change()
+        self.notify(f"Renamed to {new.name}", timeout=2)
+
+    @staticmethod
+    def _same_or_inside(path: Path, root: Path) -> bool:
+        return path == root or root in path.parents
+
+    def _retarget(self, old: Path, new: Path) -> None:
+        """Point open tabs (and the file in focus) at a moved file or folder."""
+        for tab in self.tabs:
+            if self._same_or_inside(tab.path, old):
+                tab.path = new / tab.path.relative_to(old) if tab.path != old else new
+        if self.file_path and self._same_or_inside(self.file_path, old):
+            self.file_path = self.tabs[self.active].path if 0 <= self.active < len(self.tabs) else new
+
+    def _after_path_change(self) -> None:
+        self._save_session()
+        self.refresh_chrome()
+        self._refresh_files()
+        self.detect_interpreter()
+
+    # ── files sidebar ────────────────────────────────────────────────────────
+
+    def action_toggle_files(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        root = self.project_dir()
+        try:
+            tree = self.query_one(FileTree)
+        except NoMatches:
+            tree = FileTree(root, id="files")
+            self.query_one("#main").mount(tree, before="#editor-col")
+            self.call_after_refresh(tree.focus)
+            return
+        if tree.display and tree.has_focus:
+            tree.display = False
+            self.editor.focus()
+            return
+        if Path(tree.path) != root:
+            tree.path = root
+        tree.display = True
+        tree.focus()
+
+    def _refresh_files(self) -> None:
+        try:
+            tree = self.query_one(FileTree)
+        except NoMatches:
+            return
+        tree.reload()
+
+    @on(FileTree.FileSelected)
+    def _file_chosen(self, event: FileTree.FileSelected) -> None:
+        event.stop()
+        self.open_file(Path(event.path))
+
+    @on(FileTree.Act)
+    def _tree_act(self, event: FileTree.Act) -> None:
+        path = event.path
+        folder = path if path.is_dir() else path.parent
+        if event.what == "new":
+            self.action_new_file(folder)
+        elif event.what == "folder":
+            self._ask(
+                TextPrompt("New folder", f"In {short_path(folder)}", placeholder="week2", ok="create"),
+                partial(self._make_folder, folder),
+            )
+        elif event.what == "rename":
+            if path != Path(self.query_one(FileTree).path):
+                self.action_rename_file(path)
+        elif event.what == "delete":
+            if path == Path(self.query_one(FileTree).path):
+                return
+            if path.is_dir() and any(path.iterdir()):
+                self.notify("Only empty folders can be deleted here", severity="warning")
+                return
+            if not isinstance(self.screen, ModalScreen):
+                self.push_screen(
+                    ConfirmPrompt(f"Delete {path.name}? This can't be undone.", "delete"),
+                    partial(self._delete_path, path),
+                )
+
+    def _make_folder(self, parent: Path, name: str | None) -> None:
+        if not name:
+            return
+        try:
+            (parent / name).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.notify(f"Couldn't create it: {exc}", severity="error")
+        self._refresh_files()
+
+    def _delete_path(self, path: Path, yes: bool | None) -> None:
+        if not yes:
+            return
+        index = self._tab_index(path.resolve())
+        if index >= 0:
+            if index == self.active:
+                self.saved_text = self.editor.text  # nothing to save into a file being deleted
+            else:
+                self.tabs[index].saved_text = self.tabs[index].text
+            self.action_close_tab(index)
+        try:
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.notify(f"Couldn't delete: {exc}", severity="error")
+        self._refresh_files()
+        self.query_one(FileTree).focus()
+
+    # ── outline, find, rename, help, go to definition ────────────────────────
+
+    def action_outline(self) -> None:
+        editor = self.editor
+        items = outline(editor.document.lines)
+        self._ask(
+            OutlineScreen(items, editor.cursor_location[0], editor.document.line_count), self._outline_jump
+        )
+
+    def action_goto_line(self) -> None:
+        self.action_outline()
+        self.call_after_refresh(lambda: self._prefill_outline(":"))
+
+    def _prefill_outline(self, text: str) -> None:
+        if isinstance(self.screen, OutlineScreen):
+            field = self.screen.query_one(Input)
+            field.value = text
+            field.cursor_position = len(text)
+
+    def _outline_jump(self, row: int | None) -> None:
+        if row is None:
+            return
+        editor = self.editor
+        line = editor.document[row]
+        editor.move_cursor((row, len(line) - len(line.lstrip())), center=True)
+        editor.focus()
+
+    def action_find(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        bar = self.query_one(FindBar)
+        field = self.query_one("#find", Input)
+        editor = self.editor
+        selected = editor.selected_text
+        if selected and "\n" not in selected:
+            field.value = selected
+        bar.add_class("show")
+        field.focus()
+        field.selection = (0, len(field.value)) if field.value else field.selection
+        self._find_update(True)
+
+    def close_find(self) -> None:
+        self.query_one(FindBar).remove_class("show")
+        self.editor.set_matches([])
+
+    @on(Input.Changed, "#find")
+    def _find_changed(self) -> None:
+        self._find_update(True)
+
+    def _find_update(self, select: bool) -> None:
+        editor = self.editor
+        query = self.query_one("#find", Input).value
+        matches = find_all(editor.document.lines, query)
+        index = -1
+        if matches:
+            here = sorted(editor.selection)[0]
+            index = next((i for i, m in enumerate(matches) if (m[0], m[1]) >= here), 0)
+        editor.set_matches(matches, index)
+        if select and index >= 0:
+            self._select_match(index)
+        self._find_info()
+
+    def _find_info(self) -> None:
+        editor = self.editor
+        info = self.query_one("#findinfo", Static)
+        if not self.query_one("#find", Input).value:
+            info.update(Text("↑↓ · Alt+A all", style=C.faint))
+        elif not editor.matches:
+            info.update(Text("no matches", style=C.error))
+        else:
+            info.update(Text(f"{editor.match_index + 1}/{len(editor.matches)}", style=C.text))
+
+    def _select_match(self, index: int) -> None:
+        editor = self.editor
+        row, start, end = editor.matches[index]
+        editor.set_matches(editor.matches, index)
+        editor.selection = Selection((row, start), (row, end))
+        editor.scroll_cursor_visible(center=True)
+
+    def _find_step(self, step: int) -> None:
+        editor = self.editor
+        if not editor.matches:
+            return
+        index = (editor.match_index + step) % len(editor.matches)
+        self._select_match(index)
+        self._find_info()
+
+    @on(Input.Submitted, "#find")
+    def _find_submitted(self) -> None:
+        self._find_step(1)
+
+    @on(Input.Submitted, "#replace")
+    def _replace_one(self) -> None:
+        editor = self.editor
+        if not editor.matches or editor.match_index < 0:
+            return
+        row, start, end = editor.matches[editor.match_index]
+        replacement = self.query_one("#replace", Input).value
+        editor.replace(replacement, (row, start), (row, end))
+        editor.move_cursor((row, start + len(replacement)))
+        self._find_update(True)
+
+    def action_replace_all(self) -> None:
+        editor = self.editor
+        query = self.query_one("#find", Input).value
+        matches = find_all(editor.document.lines, query)
+        if not matches:
+            return
+        replacement = self.query_one("#replace", Input).value
+        lines = list(editor.document.lines)
+        for row, start, end in reversed(matches):
+            lines[row] = lines[row][:start] + replacement + lines[row][end:]
+        self._replace_document("\n".join(lines))
+        self._find_update(False)
+        self.notify(f"Replaced {len(matches)}", timeout=2)
+
+    def _replace_document(self, text: str) -> None:
+        """Swap the whole text as one undo step, keeping the cursor where it was."""
+        editor = self.editor
+        row, col = editor.cursor_location
+        scroll = editor.scroll_offset
+        editor.replace(text, (0, 0), editor.document.end)
+        row = min(row, editor.document.line_count - 1)
+        editor.move_cursor((row, min(col, len(editor.document[row]))))
+        editor.scroll_to(scroll.x, scroll.y, animate=False, immediate=True)
+
+    def _word_under_cursor(self) -> str:
+        editor = self.editor
+        row, col = editor.cursor_location
+        word, _ = word_at(editor.document[row], col)
+        return word
+
+    def action_rename_symbol(self) -> None:
+        if isinstance(self.focused, FileTree):
+            self.focused.action_act("rename")
+            return
+        word = self._word_under_cursor()
+        if not word or keyword.iskeyword(word):
+            self.notify("Put the cursor on a variable or function name first", timeout=2)
+            return
+        self._ask(
+            TextPrompt(
+                f"Rename {word}",
+                "Everywhere it is used as a name in this file (not inside strings or comments).",
+                value=word,
+                ok="rename",
+            ),
+            partial(self._do_rename, word),
+        )
+
+    def _do_rename(self, old: str, new: str | None) -> None:
+        if not new or new == old:
+            return
+        if not new.isidentifier() or keyword.iskeyword(new):
+            self.notify(f"{new} can't be a Python name", severity="warning")
+            return
+        text, count = rename_symbol(self.editor.text, old, new)
+        if count:
+            self._replace_document(text)
+        self.notify(f"Renamed {count} place{'s' if count != 1 else ''}", timeout=2)
+
+    def action_snippets(self) -> None:
+        body = Text()
+        body.append("Snippets\n", style=Style(color=C.text, bold=True))
+        body.append(
+            "Type the word on its own line, press Tab. Tab again jumps to the next blank.\n\n", style=C.muted
+        )
+        for word, (what, _) in learn.SNIPPETS.items():
+            body.append(f"  {word:<7}", style=C.accent)
+            body.append(f"{what}\n", style=C.text)
+        body.append("\nany key to close", style=C.faint)
+        if not isinstance(self.screen, ModalScreen):
+            self.push_screen(HelpCard(body))
+
+    def action_help_word(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        editor = self.editor
+        row, col = editor.cursor_location
+        word, start = word_at(editor.document[row], col)
+        if not word:
+            self.notify("Put the cursor on a word first", timeout=2)
+            return
+        self._fetch_help(word, editor.text, row + 1, start)
+
+    @work(group="help", exclusive=True)
+    @ignore_after_exit
+    async def _fetch_help(self, word: str, source: str, line: int, col: int) -> None:
+        info = await self.completion.request(
+            "help", source=source, line=line, col=col, path=str(self.file_path), timeout=6
+        )
+        self.push_screen(HelpCard(self._help_text(word, info)))
+
+    def _help_text(self, word: str, info: dict | None) -> Text:
+        body = Text()
+        body.append(word, style=Style(color=C.accent, bold=True))
+        kind = (info or {}).get("type") or ("keyword" if keyword.iskeyword(word) else "")
+        if kind:
+            body.append(f"   {kind}", style=C.faint)
+        body.append("\n\n")
+        entry = learn.HELP.get(word)
+        mine = info and info.get("path") and self.file_path and _same_file(info["path"], self.file_path)
+        if entry:
+            what, example, tip = entry
+            body.append(what + "\n\n", style=C.text)
+            for code in example.split("\n"):
+                body.append("  " + code + "\n", style=C.callable)
+            if tip:
+                body.append("\n" + tip + "\n", style=C.muted)
+        elif mine and info.get("line"):
+            line = info["line"]
+            body.append(f"Yours: defined on line {line}\n\n", style=C.text)
+            source = (
+                self.editor.document[line - 1].strip() if line - 1 < self.editor.document.line_count else ""
+            )
+            body.append("  " + source + "\n", style=C.callable)
+            if info.get("doc"):
+                body.append("\n" + info["doc"] + "\n", style=C.muted)
+        elif info and (info.get("signatures") or info.get("doc")):
+            for sig in info.get("signatures") or []:
+                body.append("  " + sig + "\n", style=C.callable)
+            if info.get("doc"):
+                body.append("\n" + info["doc"] + "\n", style=C.muted)
+        else:
+            body.append("No help for this word yet.\n", style=C.muted)
+        body.append("\nany key to close", style=C.faint)
+        return body
+
+    def action_goto_definition(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        editor = self.editor
+        row, col = editor.cursor_location
+        word, start = word_at(editor.document[row], col)
+        if word:
+            self._fetch_definition(word, editor.text, row + 1, start)
+
+    @work(group="help", exclusive=True)
+    @ignore_after_exit
+    async def _fetch_definition(self, word: str, source: str, line: int, col: int) -> None:
+        info = await self.completion.request(
+            "goto", source=source, line=line, col=col, path=str(self.file_path), timeout=6
+        )
+        if not info or not info.get("line"):
+            self.notify(f"No definition found for {word}", timeout=2)
+            return
+        path = Path(info["path"]) if info.get("path") else None
+        if path is None or info.get("builtin") or "site-packages" in path.parts or not path.suffix == ".py":
+            self.action_help_word()  # built into Python or a library: explain it instead
+            return
+        if not self.file_path:
+            return
+        self._back.append((self.file_path, self.editor.cursor_location))
+        del self._back[:-50]
+        if not _same_file(str(path), self.file_path):
+            self.open_file(path)
+        self.editor.move_cursor((info["line"] - 1, info.get("col") or 0), center=True)
+
+    def action_go_back(self) -> None:
+        if not self._back:
+            return
+        path, location = self._back.pop()
+        if not self.file_path or not _same_file(str(path), self.file_path):
+            if not path.exists():
+                return
+            self.open_file(path)
+        row = min(location[0], self.editor.document.line_count - 1)
+        self.editor.move_cursor((row, location[1]), center=True)
 
     def action_open(self) -> None:
         if not CommandPalette.is_open(self):
@@ -681,6 +1205,8 @@ class Pytobs(App[None]):
         if self.cfg.autosave:
             self._debounce("autosave", 1.0, self.save)
         self.schedule_lint(0.5)
+        if self.query_one(FindBar).has_class("show"):
+            self._debounce("find", 0.15, partial(self._find_update, False))
 
     @on(TextArea.SelectionChanged, "#editor")
     def _on_cursor(self) -> None:
@@ -1328,6 +1854,17 @@ class Pytobs(App[None]):
                 self.current.close_input()
             event.stop()
         elif event.key == "escape" and isinstance(self.focused, Input):
+            if self.focused.id in ("find", "replace"):
+                self.close_find()
+            self.editor.focus()
+        elif isinstance(self.focused, Input) and self.focused.id in ("find", "replace"):
+            if event.key in ("down", "up"):
+                event.stop()
+                self._find_step(1 if event.key == "down" else -1)
+            elif event.key == "alt+a":
+                event.stop()
+                self.action_replace_all()
+        elif event.key == "escape" and isinstance(self.focused, FileTree):
             self.editor.focus()
 
     # ── commands ─────────────────────────────────────────────────────────────
@@ -1354,9 +1891,56 @@ class Pytobs(App[None]):
         yield SystemCommand(
             "Previous file", "Focus the previous open file  (Ctrl+PgUp or Alt+←)", self.action_prev_tab
         )
+        yield SystemCommand("New file", "Create a named file in this folder  (Ctrl+N)", self.action_new_file)
         yield SystemCommand(
-            "New scratch file", "Start a fresh scratch file  (Ctrl+N)", self.action_new_scratch
+            "New scratch file", "Start a fresh, unnamed scratch file", self.action_new_scratch
         )
+        yield SystemCommand(
+            "Save as…", "Save this file under a new name  (Ctrl+S on a scratch file)", self.action_save_as
+        )
+        yield SystemCommand("Rename file", "Give this file a new name", self.action_rename_file)
+        yield SystemCommand("Files", "Show or hide the files sidebar  (Alt+E)", self.action_toggle_files)
+        yield SystemCommand("Outline", "Functions and classes in this file  (Ctrl+O)", self.action_outline)
+        yield SystemCommand("Go to line", "Jump to a line number  (Ctrl+O, then :42)", self.action_goto_line)
+        yield SystemCommand("Find and replace", "Search this file  (Ctrl+F)", self.action_find)
+        yield SystemCommand(
+            "Replace all", "Replace every match of the find bar  (Alt+A)", self.action_replace_all
+        )
+        yield SystemCommand(
+            "Rename variable",
+            "Rename the name under the cursor everywhere in this file  (F2)",
+            self.action_rename_symbol,
+        )
+        yield SystemCommand(
+            "Explain this word",
+            "Plain-English help for the word under the cursor  (F1)",
+            self.action_help_word,
+        )
+        yield SystemCommand(
+            "Go to definition",
+            "Jump to where a name is defined  (F12, back with Shift+F12)",
+            self.action_goto_definition,
+        )
+        yield SystemCommand(
+            "Fold / unfold",
+            "Collapse the block the cursor is in  (F9, or click ▾ ▸)",
+            self.editor.action_toggle_fold,
+        )
+        yield SystemCommand("Fold all", "Collapse every block in this file", self.editor.fold_all)
+        yield SystemCommand("Unfold all", "Open every folded block", self.editor.unfold_all)
+        yield SystemCommand("Select all", "Select the whole file  (Ctrl+A)", self.editor.action_select_all)
+        yield SystemCommand(
+            "Delete lines", "Delete the selected lines  (Ctrl+Shift+K)", self.editor.action_delete_line
+        )
+        yield SystemCommand(
+            "Move lines up", "Move the selected lines up  (Alt+↑)", partial(self.editor.action_move_lines, -1)
+        )
+        yield SystemCommand(
+            "Move lines down",
+            "Move the selected lines down  (Alt+↓)",
+            partial(self.editor.action_move_lines, 1),
+        )
+        yield SystemCommand("Snippets", "Words you can type then press Tab to expand", self.action_snippets)
         yield SystemCommand(
             "Install a package",
             "pip install into this folder's .venv, e.g. requests",

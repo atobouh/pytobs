@@ -110,6 +110,8 @@ for _name in (
 for _name in ("number", "float", "boolean", "constant.builtin", "constant"):
     _SYNTAX[_name] = _style(C.constant)
 _SYNTAX["comment"] = Style(color=C.muted, italic=True)
+_SYNTAX["pytobs.match"] = Style(bgcolor="#4A4535")
+_SYNTAX["pytobs.match.current"] = Style(bgcolor=C.warn, color=C.base)
 
 EDITOR_THEME = TextAreaTheme(
     name="sumi",

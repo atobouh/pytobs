@@ -24,7 +24,7 @@ After that, `pytobs` works from any terminal:
 ```powershell
 pytobs                # reopen your last file, or start a scratch file
 pytobs hello.py       # open (or create) a file
-pytobs .              # open in this folder and pick a file with Ctrl+P
+pytobs .              # open in this folder; Alt+E shows its files
 ```
 
 Until this work is merged into `main`, install from its branch:
@@ -45,23 +45,59 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 
 ## Keys
 
+**Run and learn**
+
 | Key | Does |
 |---|---|
 | **Ctrl+R** or **F5** | Save and run |
 | **F6** | Watch it run: step through your code line by line (← → to step, Esc to finish) |
 | **Ctrl+T** | Run every `test_` function in this file |
+| **F1** | Explain the word under the cursor in plain English (`print`, `.sort`, `for`, your own functions) |
+| **Tab** after `for`, `if`, `def`, `class`, `try`, `main`, … | Write the whole block; Tab again jumps to the next blank (Ctrl+K → Snippets lists them all) |
 | **Ctrl+G** | Your progress: streak, runs, coding time, errors you meet most |
-| **Ctrl+C** | Copy selected text (drag over the output to select) · otherwise stop the running program |
 | **Ctrl+E** | Jump to the line that raised the error |
-| **Ctrl+P** | Open a file in this folder (opens in a new tab; open files are listed first) |
-| **Alt+← / Alt+→** or **Ctrl+PgUp / Ctrl+PgDn** | Previous / next open file |
-| **Alt+1 … Alt+9** | Jump to open file 1–9 |
+| **Ctrl+C** | Copy selected text (drag over the output to select) · otherwise stop the running program |
+
+**Files**
+
+| Key | Does |
+|---|---|
+| **Ctrl+N** | New file: type a name like `loops.py` or `week2/loops.py` (empty = scratch file) |
+| **Ctrl+S** | Save · on a scratch file it asks for a name first |
+| **Alt+E** | Files sidebar: Enter opens · **n** new file · **f** new folder · **r** rename · **Delete** delete |
+| **Ctrl+P** | Open a file in this folder (opens in a new tab) |
+| **Alt+← / Alt+→** or **Ctrl+PgUp / Ctrl+PgDn** | Previous / next open file · **Alt+1 … Alt+9** jump to one |
 | **Ctrl+W** | Close the file in focus (click × or middle-click a tab too) |
-| **Ctrl+N** | New scratch file |
-| **Ctrl+K** | All commands, including Install a package |
-| **Alt+F** or **F8** | Format with ruff |
+| **Ctrl+K → Save as / Rename file** | Name or rename the file in focus |
+
+**Moving around**
+
+| Key | Does |
+|---|---|
+| **Ctrl+O** | Outline: your functions and classes, type to filter · `:42` goes to line 42 |
+| **Ctrl+F** | Find and replace · ↑ ↓ or Enter between matches · Tab to the replace box, Enter replaces one · **Alt+A** replaces all |
+| **F9** | Fold or unfold the `if` / `for` / `def` / `class` the cursor is in (or click ▾ ▸ beside the line number) · Ctrl+K → Fold all |
+| **F12** | Go to where a name is defined · **Shift+F12** back |
+
+**Editing**
+
+| Key | Does |
+|---|---|
+| **Ctrl+A** | Select everything |
+| **Shift+↑ ↓**, then **Backspace** / **Ctrl+X** | Delete / cut every selected line |
+| **Ctrl+Shift+K** | Delete the selected lines (whole lines, even if only partly selected) |
+| **Alt+↑ / Alt+↓** | Move lines up / down |
+| **F2** | Rename a variable or function everywhere in this file (strings and comments are left alone) |
 | **Ctrl+/** | Comment or uncomment lines |
 | **Ctrl+D** | Duplicate line (in the input box: end of input) |
+| **Ctrl+Z / Ctrl+Y** | Undo / redo |
+| **Alt+F** or **F8** | Format with ruff |
+
+**Window**
+
+| Key | Does |
+|---|---|
+| **Ctrl+K** | All commands, including Install a package |
 | **Ctrl+B** | Output beside or below the editor |
 | **Ctrl+L** | Clear output · **Ctrl+K → Copy all output** copies everything |
 | **Tab / Enter** | Accept a suggestion · **Esc** closes it |
