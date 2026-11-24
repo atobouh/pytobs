@@ -140,8 +140,11 @@ class OutlineScreen(ModalScreen[int | None]):
         if q.startswith(":"):
             digits = q[1:].strip()
             if digits.isdigit():
-                line = max(1, min(int(digits), self.line_count))
-                options.add_option(Option(Text.assemble(("Go to line ", C.muted), (str(line), C.text))))
+                line = max(1, min(int(digits), 100_000))
+                label = Text.assemble(("Go to line ", C.muted), (str(line), C.text))
+                if line > self.line_count:
+                    label.append(f"   adds {line - self.line_count} empty lines", style=C.faint)
+                options.add_option(Option(label))
                 self._rows.append(line - 1)
                 options.highlighted = 0
             return
@@ -195,9 +198,9 @@ class HelpCard(ModalScreen[None]):
         background: {C.surface}; padding: 1 2; overflow-y: auto; }}
     """
 
-    def __init__(self, body: Text) -> None:
+    def __init__(self, body) -> None:
         super().__init__()
-        self.body = body
+        self.body = body  # a Text, or any Rich renderable
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -205,7 +208,19 @@ class HelpCard(ModalScreen[None]):
 
     def on_key(self, event: events.Key) -> None:
         event.stop()
-        self.dismiss(None)
+        panel = self.query_one(Vertical)
+        scroll = {
+            "up": lambda: panel.scroll_relative(y=-1, animate=False),
+            "down": lambda: panel.scroll_relative(y=1, animate=False),
+            "pageup": lambda: panel.scroll_page_up(animate=False),
+            "pagedown": lambda: panel.scroll_page_down(animate=False),
+            "home": lambda: panel.scroll_home(animate=False),
+            "end": lambda: panel.scroll_end(animate=False),
+        }.get(event.key)
+        if scroll:
+            scroll()  # long explanations scroll; any other key closes
+        else:
+            self.dismiss(None)
 
     def on_click(self) -> None:
         self.dismiss(None)

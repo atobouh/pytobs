@@ -6,6 +6,7 @@ import asyncio
 import json
 import keyword
 import os
+import re
 import time
 from collections.abc import Iterable
 import dataclasses
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from functools import partial, wraps
 from pathlib import Path
 
+from rich.console import Group
+from rich.markdown import Markdown
 from rich.style import Style
 from rich.text import Text
 from textual import events, on, work
@@ -56,6 +59,17 @@ SKIP_DIRS = {
     "dist",
     "build",
 }
+
+
+TRAILING_BLANKS = re.compile(r"\n(?:[ \t]*\n)+[ \t]*\Z")
+
+
+def disk_text(text: str) -> str:
+    """What goes in the file: empty lines added below the code are not written."""
+    if not text.strip():
+        return ""
+    m = TRAILING_BLANKS.search(text)
+    return text[: m.start()] + "\n" if m else text
 
 
 def short_path(path: Path) -> str:
@@ -186,6 +200,7 @@ OutputLog {{ height: 1fr; }}
 Screen.stacked #main {{ layout: vertical; }}
 Screen.stacked #editor-col {{ width: 1fr; height: 3fr; }}
 Screen.stacked #output-col {{ width: 1fr; height: 2fr; padding: 1 0 0 2; }}
+Screen.no-output #output-col {{ display: none; }}
 Screen.stacked FileTree {{ width: 1fr; height: 8; }}
 #popup {{ layer: popup; position: absolute; width: auto; height: auto; display: none; }}
 #popup.show {{ display: block; }}
@@ -228,6 +243,7 @@ class Pytobs(App[None]):
         Binding("alt+f,f8", "format", "Format", priority=True),
         Binding("ctrl+l", "clear_output", "Clear output", priority=True),
         Binding("ctrl+b", "toggle_layout", "Layout", priority=True),
+        Binding("ctrl+j", "toggle_output", "Hide output", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
@@ -335,6 +351,7 @@ class Pytobs(App[None]):
             ("F1", "explain a word"),
             ("Tab", "after for / if / def: fills the block"),
             ("Ctrl+G", "your progress"),
+            ("Ctrl+J", "hide or show this panel"),
             ("Ctrl+K", "all commands, install packages"),
         ):
             line = Text()
@@ -355,6 +372,13 @@ class Pytobs(App[None]):
     def _apply_layout(self) -> None:
         stacked = self._layout_forced == "stacked" or (self._layout_forced is None and self.size.width < 100)
         self.screen.set_class(stacked, "stacked")
+
+    def action_toggle_output(self) -> None:
+        hidden = not self.screen.has_class("no-output")
+        self.screen.set_class(hidden, "no-output")
+        if hidden and not self.editor.has_focus and not isinstance(self.screen, ModalScreen):
+            self.editor.focus()
+        self.call_after_refresh(self._render_tabline)
 
     def action_toggle_layout(self) -> None:
         current = self.screen.has_class("stacked")
@@ -519,7 +543,7 @@ class Pytobs(App[None]):
             return True
         text = self.editor.text
         try:
-            atomic_write(self.file_path, text)
+            atomic_write(self.file_path, disk_text(text))
         except OSError as exc:
             self.notify(f"Couldn't save: {exc}", severity="error")
             return False
@@ -625,7 +649,7 @@ class Pytobs(App[None]):
             return
         text = self.editor.text
         try:
-            atomic_write(path, text)
+            atomic_write(path, disk_text(text))
         except OSError as exc:
             self.notify(f"Couldn't save: {exc}", severity="error")
             return
@@ -799,6 +823,7 @@ class Pytobs(App[None]):
         if row is None:
             return
         editor = self.editor
+        editor.ensure_line(row)
         line = editor.document[row]
         editor.move_cursor((row, len(line) - len(line.lstrip())), center=True)
         editor.focus()
@@ -950,8 +975,75 @@ class Pytobs(App[None]):
         if not isinstance(self.screen, ModalScreen):
             self.push_screen(HelpCard(body))
 
+    @on(events.Click, "#status")
+    def _status_clicked(self) -> None:
+        if self._problems_here():
+            self.action_problem_details()
+
+    @on(CodeEditor.MarkerClicked)
+    def _marker_clicked(self, event: CodeEditor.MarkerClicked) -> None:
+        problems = [d for d in self.diags if d.row == event.row]
+        if problems and not isinstance(self.screen, ModalScreen):
+            self._show_problems(problems)
+
+    def _problems_here(self) -> list[lint.Diagnostic]:
+        row = self.editor.cursor_location[0]
+        return [d for d in self.diags if d.row == row]
+
+    def action_problem_details(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        problems = self._problems_here()
+        if not problems:
+            self.notify("No problem on this line", timeout=1.5)
+            return
+        self._show_problems(problems)
+
+    @work(group="help", exclusive=True)
+    @ignore_after_exit
+    async def _show_problems(self, problems: list[lint.Diagnostic]) -> None:
+        docs = {}
+        for code in dict.fromkeys(d.code for d in problems):
+            docs[code] = await lint.rule_doc(code)
+        self.push_screen(HelpCard(self._problem_card(problems, docs)))
+
+    def _problem_card(self, problems: list[lint.Diagnostic], docs: dict[str, str | None]) -> Group:
+        editor = self.editor
+        parts: list = []
+        for d in problems:
+            head = Text()
+            head.append(
+                d.code if d.code != "syntax" else "syntax error",
+                style=Style(color=C.error if d.error else C.warn, bold=True),
+            )
+            head.append(f"   line {d.row + 1}, column {d.col + 1}\n\n", style=C.faint)
+            head.append(d.message + "\n\n", style=C.text)
+            line = editor.document[d.row] if d.row < editor.document.line_count else ""
+            head.append(f"  {d.row + 1:>4} │ ", style=C.faint)
+            head.append(line.rstrip() + "\n", style=C.callable)
+            head.append(" " * (9 + d.col) + "^\n", style=C.error if d.error else C.warn)
+            parts.append(head)
+        for code, doc in docs.items():
+            if doc:
+                parts.append(Text(""))
+                parts.append(Markdown(doc, code_theme="monokai", inline_code_theme="monokai"))
+            elif code == "syntax":
+                parts.append(
+                    Text(
+                        "\nPython can't read this line, so nothing in the file runs until it's fixed.\n"
+                        "Look at this line and the one just above it for: a missing : after if / for / def / class,\n"
+                        "a ( [ { or quote that is never closed, = where you meant ==, or a stray character.",
+                        style=C.muted,
+                    )
+                )
+        parts.append(Text("\n↑ ↓ scroll   any other key closes", style=C.faint))
+        return Group(*parts)
+
     def action_help_word(self) -> None:
         if isinstance(self.screen, ModalScreen):
+            return
+        if self._problems_here():
+            self.action_problem_details()  # a line with a ruff problem: explain the problem
             return
         editor = self.editor
         row, col = editor.cursor_location
@@ -1170,6 +1262,8 @@ class Pytobs(App[None]):
             mid.append(f"{G.dot} ", style=C.ok)
             mid.append("ruff", style=C.muted)
         right = Text(no_wrap=True)
+        if diag:
+            right.append("F1 details   ", style=C.faint)
         right.append(f"Ln {row + 1:<4} Col {col + 1:<3}", style=C.muted)
         hints = Text(no_wrap=True)
         for key, label in (("^R", "run"), ("^P", "open"), ("^K", "menu")):
@@ -1498,6 +1592,7 @@ class Pytobs(App[None]):
 
     def _launch(self, mode: str) -> None:
         self.hide_popups()
+        self.screen.remove_class("no-output")  # running brings the output back
         if not self.save() or not self.file_path:
             return
         self.run_worker(self._start_run(mode), exclusive=True, group="run")
@@ -1955,6 +2050,19 @@ class Pytobs(App[None]):
         yield SystemCommand("Jump to error", "Cursor to the failing line  (Ctrl+E)", self.action_jump_error)
         yield SystemCommand("Copy all output", "Copy everything in the output pane", self.action_copy_output)
         yield SystemCommand("Clear output", "Empty the output pane  (Ctrl+L)", self.action_clear_output)
+        yield SystemCommand(
+            "Hide / show output", "Give the code the whole width  (Ctrl+J)", self.action_toggle_output
+        )
+        yield SystemCommand(
+            "Add 100 empty lines",
+            "Room below your code (also: click under the last line)",
+            partial(self.editor.add_lines, 100),
+        )
+        yield SystemCommand(
+            "Problem details",
+            "Full ruff message and explanation for this line  (F1)",
+            self.action_problem_details,
+        )
         yield SystemCommand(
             "Toggle layout", "Output beside or below the editor  (Ctrl+B)", self.action_toggle_layout
         )

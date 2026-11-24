@@ -419,3 +419,67 @@ async def test_files_sidebar(tmp_path: Path) -> None:
         assert tree.has_focus
         names = [n.label.plain for n in tree.root.children]
         assert "b.py" in names and "ruff.toml" in names
+
+
+async def test_hide_output_and_running_brings_it_back(tmp_path: Path) -> None:
+    script = tmp_path / "o.py"
+    script.write_text('print("hi")\n')
+    app = Pytobs(path=script, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        col = app.query_one("#output-col")
+        editor_width = app.query_one("#editor-col").size.width
+        await pilot.press("ctrl+j")
+        await _settle(pilot)
+        assert not col.display and app.query_one("#editor-col").size.width > editor_width
+        await pilot.press("ctrl+r")
+        await _wait(app, pilot)
+        assert col.display
+
+
+async def test_room_below_code_and_go_to_missing_line(tmp_path: Path) -> None:
+    script = tmp_path / "e.py"
+    script.write_text("x = 1\n")
+    app = Pytobs(path=script, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        editor = app.editor
+        await pilot.click("#editor", offset=(10, 12))  # empty space under the code
+        assert editor.cursor_location == (12, 0) and editor.document.line_count == 13
+        await _type(pilot, "y = 2")
+        app.save()
+        assert script.read_text() == "x = 1\n" + "\n" * 11 + "y = 2"
+        await pilot.press("ctrl+z")
+        app.save()
+        assert script.read_text() == "x = 1\n"  # empty lines below the code are never written
+        await pilot.press("ctrl+o")
+        await _settle(pilot)
+        await _type(pilot, ":40")
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert editor.cursor_location == (39, 0)
+
+
+async def test_full_ruff_message_on_f1(tmp_path: Path) -> None:
+    script = tmp_path / "w.py"
+    script.write_text("import os\nprint(1)\n")
+    app = Pytobs(path=script, python=sys.executable)
+    async with app.run_test(size=(120, 30)) as pilot:
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app.diags:
+                break
+        assert "F401" in [d.code for d in app.diags]
+        app.editor.move_cursor((0, 3))
+        await pilot.press("f1")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if type(app.screen).__name__ == "HelpCard":
+                break
+        card = app.screen
+        assert type(card).__name__ == "HelpCard"
+        text = "".join(r.plain for r in card.body.renderables if hasattr(r, "plain"))
+        assert "F401" in text and "`os` imported but unused" in text and "import os" in text
+        assert any(type(r).__name__ == "Markdown" for r in card.body.renderables)  # ruff's own explanation
+        await pilot.press("down")
+        assert type(app.screen).__name__ == "HelpCard"  # arrows scroll, they don't close
+        await pilot.press("escape")
+        assert type(app.screen).__name__ != "HelpCard"

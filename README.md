@@ -52,7 +52,7 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | **Ctrl+R** or **F5** | Save and run |
 | **F6** | Watch it run: step through your code line by line (← → to step, Esc to finish) |
 | **Ctrl+T** | Run every `test_` function in this file |
-| **F1** | Explain the word under the cursor in plain English (`print`, `.sort`, `for`, your own functions) |
+| **F1** | Explain the word under the cursor in plain English (`print`, `.sort`, `for`, your own functions) · on a line with a ruff ● problem: the full message, the spot, and ruff's explanation of the rule (click the ● or the status bar too) |
 | **Tab** after `for`, `if`, `def`, `class`, `try`, `main`, … | Write the whole block; Tab again jumps to the next blank (Ctrl+K → Snippets lists them all) |
 | **Ctrl+G** | Your progress: streak, runs, coding time, errors you meet most |
 | **Ctrl+E** | Jump to the line that raised the error |
@@ -74,7 +74,8 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 
 | Key | Does |
 |---|---|
-| **Ctrl+O** | Outline: your functions and classes, type to filter · `:42` goes to line 42 |
+| **Ctrl+O** | Outline: your functions and classes, type to filter · `:42` goes to line 42, adding empty lines if the file is shorter |
+| **Click below the code** | Creates the lines down to where you clicked, no Enter-Enter-Enter (empty lines at the end are never saved to the file) |
 | **Ctrl+F** | Find and replace · ↑ ↓ or Enter between matches · Tab to the replace box, Enter replaces one · **Alt+A** replaces all |
 | **F9** | Fold or unfold the `if` / `for` / `def` / `class` the cursor is in (or click ▾ ▸ beside the line number) · Ctrl+K → Fold all |
 | **F12** | Go to where a name is defined · **Shift+F12** back |
@@ -98,6 +99,7 @@ To remove everything: `pytobs --uninstall` and then `uv tool uninstall pytobs`.
 | Key | Does |
 |---|---|
 | **Ctrl+K** | All commands, including Install a package |
+| **Ctrl+J** | Hide the output panel so the code gets the full width · running (Ctrl+R, F6, Ctrl+T) brings it back |
 | **Ctrl+B** | Output beside or below the editor |
 | **Ctrl+L** | Clear output · **Ctrl+K → Copy all output** copies everything |
 | **Tab / Enter** | Accept a suggestion · **Esc** closes it |

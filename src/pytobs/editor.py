@@ -9,6 +9,7 @@ from rich.style import Style
 from textual import events
 from textual.binding import Binding
 from textual.document._document_navigator import DocumentNavigator
+from textual.geometry import Size
 from textual.message import Message
 from textual.strip import Strip
 from textual.widgets import TextArea
@@ -67,6 +68,13 @@ class CodeEditor(TextArea):
             super().__init__()
             self.editor = editor
             self.char = char
+
+    class MarkerClicked(Message):
+        """The problem dot beside a line number was clicked."""
+
+        def __init__(self, row: int) -> None:
+            super().__init__()
+            self.row = row
 
     class PopupKey(Message):
         """A navigation key pressed while a popup is open."""
@@ -308,8 +316,45 @@ class CodeEditor(TextArea):
         if event.x != 0 or not self.show_line_numbers:
             return
         row = self.wrapped_document.offset_to_location((0, event.y + int(self.scroll_offset.y)))[0]
-        if row in self.folds or block_end(self.document.lines, row) is not None:
+        if row in self.diagnostics and row not in self.folds:
+            self.post_message(self.MarkerClicked(row))  # the ● dot: show the full message
+        elif row in self.folds or block_end(self.document.lines, row) is not None:
             self.action_toggle_fold(row)
+
+    # ── room below the last line ─────────────────────────────────────────────
+
+    def _refresh_size(self) -> None:
+        # Scroll past the end, so there is always empty space below the code to click into.
+        width, _ = self.document.get_size(self.indent_width)
+        room = max(0, self.scrollable_content_region.height - 3)
+        self.virtual_size = Size(width + self.gutter_width + 1, self.wrapped_document.height + room)
+        self._refresh_scrollbars()
+
+    def on_resize(self) -> None:
+        self._refresh_size()
+
+    def add_lines(self, count: int) -> None:
+        """Append empty lines so that rows below the code exist (one undo step)."""
+        if count <= 0 or self.read_only:
+            return
+        end = self.document.end
+        self._skipping = True
+        try:
+            self.replace("\n" * count, end, end, maintain_selection_offset=True)
+        finally:
+            self._skipping = False
+
+    def ensure_line(self, row: int) -> None:
+        """Make sure 0-based `row` exists."""
+        self.add_lines(row - self.document.line_count + 1)
+
+    async def _on_mouse_down(self, event: events.MouseDown) -> None:
+        # a click in the empty space under the code creates the lines down to that row
+        offset = event.y + int(self.scroll_offset.y)
+        below = offset - self.wrapped_document.height
+        if below >= 0 and event.x >= self.gutter_width and event.button == 1:
+            self.add_lines(below + 1)
+        await super()._on_mouse_down(event)
 
     def _skip_hidden(self, direction: int, select: bool) -> None:
         row, col = self.cursor_location

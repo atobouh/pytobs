@@ -87,6 +87,18 @@ async def check(source: str, path: Path) -> list[Diagnostic]:
     return diags
 
 
+async def rule_doc(code: str) -> str | None:
+    """Ruff's own explanation of a rule (what it does, why, an example), as Markdown."""
+    exe = ruff_bin()
+    if not exe or not code or code == "syntax":
+        return None
+    try:
+        status, out, _ = await _run([exe, "rule", code], "")
+    except OSError:
+        return None
+    return out if status == 0 and out.strip() else None
+
+
 async def format_source(source: str, path: Path) -> str | None:
     exe = ruff_bin()
     if not exe:
